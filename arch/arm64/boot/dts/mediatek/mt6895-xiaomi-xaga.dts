@@ -1285,3 +1285,14 @@ bias-disable;
 
 /* Local USB/OTG bring-up; TCPM owns power direction and current limits. */
 #include "mt6895-xaga-usb-tcpm.dtsi"
+
+/*
+ * Preserve the validated handset 725 mV VCORE request during boot.
+ * This is a board handover policy for a shared rail, not the minimum
+ * voltage required by the video codecs. Display OPP voting and the
+ * minimum required voltage have not been established for every state.
+ * Keep the existing constraint until that work is validated.
+ */
+&dvfsrc_vcore {
+	regulator-min-microvolt = <725000>;
+};
