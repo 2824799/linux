@@ -46,6 +46,21 @@ static int vidioc_venc_s_ctrl(struct v4l2_ctrl *ctrl)
 	struct mtk_enc_params *p = &ctx->enc_params;
 	int ret = 0;
 
+	/* Static VCP controls must not silently change after configuration. */
+	if (ctx->dev->venc_pdata->uses_vcp && ctx->m2m_ctx &&
+	    (vb2_is_streaming(&ctx->m2m_ctx->out_q_ctx.q) ||
+	     vb2_is_streaming(&ctx->m2m_ctx->cap_q_ctx.q))) {
+		switch (ctrl->id) {
+		case V4L2_CID_MPEG_VIDEO_BITRATE:
+		case V4L2_CID_MPEG_VIDEO_H264_I_PERIOD:
+		case V4L2_CID_MPEG_VIDEO_GOP_SIZE:
+		case V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME:
+			break;
+		default:
+			return -EBUSY;
+		}
+	}
+
 	switch (ctrl->id) {
 	case V4L2_CID_MPEG_VIDEO_BITRATE_MODE:
 		mtk_v4l2_venc_dbg(2, ctx, "V4L2_CID_MPEG_VIDEO_BITRATE_MODE val= %d", ctrl->val);
@@ -243,6 +258,10 @@ static int vidioc_venc_s_parm(struct file *file, void *priv,
 		timeperframe->numerator = MTK_DEFAULT_FRAMERATE_NUM;
 		timeperframe->denominator = MTK_DEFAULT_FRAMERATE_DENOM;
 	}
+
+	if (ctx->dev->venc_pdata->uses_vcp &&
+	    timeperframe->denominator < timeperframe->numerator)
+		return -EINVAL;
 
 	ctx->enc_params.framerate_num = timeperframe->denominator;
 	ctx->enc_params.framerate_denom = timeperframe->numerator;
@@ -453,7 +472,7 @@ static int vidioc_venc_s_fmt_cap(struct file *file, void *priv,
 		if (ret) {
 			mtk_v4l2_venc_err(ctx, "venc_if_init failed=%d, codec type=%x",
 					  ret, q_data->fmt->fourcc);
-			return -EBUSY;
+			return ret;
 		}
 		ctx->state = MTK_STATE_INIT;
 	}
@@ -470,6 +489,8 @@ static int vidioc_venc_s_fmt_out(struct file *file, void *priv,
 	struct mtk_q_data *q_data = mtk_venc_get_q_data(ctx, f->type);
 	int ret, i;
 	const struct mtk_video_fmt *fmt;
+	unsigned int visible_w = f->fmt.pix_mp.width;
+	unsigned int visible_h = f->fmt.pix_mp.height;
 
 	vq = v4l2_m2m_get_vq(ctx->m2m_ctx, f->type);
 
@@ -489,10 +510,25 @@ static int vidioc_venc_s_fmt_out(struct file *file, void *priv,
 		return ret;
 
 	q_data->fmt = fmt;
-	q_data->visible_width = f->fmt.pix_mp.width;
-	q_data->visible_height = f->fmt.pix_mp.height;
 	q_data->coded_width = f->fmt.pix_mp.width;
 	q_data->coded_height = f->fmt.pix_mp.height;
+	if (pdata->uses_vcp) {
+		/* try_fmt clamps the coded size to the supported range and aligns
+		 * it up; the requested size stays visible and is expressed to
+		 * firmware through the crop path. Clamp the request into that range
+		 * before rounding up to the H.264 4:2:0 two-pixel crop unit, so the
+		 * result is always representable and never overflows on extreme
+		 * requests.
+		 */
+		unsigned int w = clamp(visible_w, MTK_VENC_MIN_W, q_data->coded_width);
+		unsigned int h = clamp(visible_h, MTK_VENC_MIN_H, q_data->coded_height);
+
+		q_data->visible_width = min(ALIGN(w, 2), q_data->coded_width);
+		q_data->visible_height = min(ALIGN(h, 2), q_data->coded_height);
+	} else {
+		q_data->visible_width = q_data->coded_width;
+		q_data->visible_height = q_data->coded_height;
+	}
 
 	q_data->field = f->fmt.pix_mp.field;
 	ctx->colorspace = f->fmt.pix_mp.colorspace;
@@ -626,8 +662,16 @@ static int vidioc_venc_s_selection(struct file *file, void *priv,
 		/* Only support crop from (0,0) */
 		s->r.top = 0;
 		s->r.left = 0;
-		s->r.width = min(s->r.width, q_data->coded_width);
-		s->r.height = min(s->r.height, q_data->coded_height);
+		/* Clamp into the negotiated frame before rounding up to the two
+		 * pixel H.264 4:2:0 crop unit; ALIGN() of an extreme request would
+		 * otherwise wrap around to a zero-sized crop.
+		 */
+		s->r.width = clamp_t(u32, s->r.width, MTK_VENC_MIN_W,
+				     q_data->coded_width);
+		s->r.height = clamp_t(u32, s->r.height, MTK_VENC_MIN_H,
+				      q_data->coded_height);
+		s->r.width = min(ALIGN(s->r.width, 2), q_data->coded_width);
+		s->r.height = min(ALIGN(s->r.height, 2), q_data->coded_height);
 		q_data->visible_width = s->r.width;
 		q_data->visible_height = s->r.height;
 		break;
@@ -919,9 +963,26 @@ static void vb2ops_venc_stop_streaming(struct vb2_queue *q)
 {
 	struct mtk_vcodec_enc_ctx *ctx = vb2_get_drv_priv(q);
 	struct vb2_v4l2_buffer *src_buf, *dst_buf;
+	struct venc_done_result enc_result = {};
+	bool other_streaming;
 	int ret;
 
 	mtk_v4l2_venc_dbg(2, ctx, "[%d]-> type=%d", ctx->id, q->type);
+	other_streaming = q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE ?
+		vb2_is_streaming(&ctx->m2m_ctx->out_q_ctx.q) :
+		vb2_is_streaming(&ctx->m2m_ctx->cap_q_ctx.q);
+
+	/* Async VCP buffers have already left the m2m ready queues. Drain them
+	 * before returning either queue to VB2, but keep the encoder session
+	 * alive until both queues have stopped.
+	 */
+	if (ctx->dev->venc_pdata->uses_vcp && ctx->drv_handle &&
+	    ctx->state != MTK_STATE_ABORT && other_streaming) {
+		ret = venc_if_encode(ctx, VENC_START_OPT_ENCODE_FRAME_FINAL,
+				     NULL, NULL, &enc_result);
+		if (ret)
+			mtk_v4l2_venc_err(ctx, "VCP drain on STREAMOFF failed=%d", ret);
+	}
 
 	if (q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
 		while ((dst_buf = v4l2_m2m_dst_buf_remove(ctx->m2m_ctx))) {
@@ -962,10 +1023,7 @@ static void vb2ops_venc_stop_streaming(struct vb2_queue *q)
 		}
 	}
 
-	if ((q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
-	     vb2_is_streaming(&ctx->m2m_ctx->out_q_ctx.q)) ||
-	    (q->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE &&
-	     vb2_is_streaming(&ctx->m2m_ctx->cap_q_ctx.q))) {
+	if (other_streaming) {
 		mtk_v4l2_venc_dbg(1, ctx, "[%d]-> q type %d out=%d cap=%d",
 				  ctx->id, q->type,
 				  vb2_is_streaming(&ctx->m2m_ctx->out_q_ctx.q),
@@ -1015,6 +1073,8 @@ static int mtk_venc_encode_header(void *priv)
 	bs_buf.va = vb2_plane_vaddr(&dst_buf->vb2_buf, 0);
 	bs_buf.dma_addr = vb2_dma_contig_plane_dma_addr(&dst_buf->vb2_buf, 0);
 	bs_buf.size = (size_t)dst_buf->vb2_buf.planes[0].length;
+	ctx->active_src = NULL;
+	ctx->active_dst = &dst_buf->vb2_buf;
 
 	mtk_v4l2_venc_dbg(1, ctx,
 			  "[%d] buf id=%d va=0x%p dma_addr=0x%llx size=%zu",
@@ -1024,6 +1084,7 @@ static int mtk_venc_encode_header(void *priv)
 	ret = venc_if_encode(ctx,
 			VENC_START_OPT_ENCODE_SEQUENCE_HEADER,
 			NULL, &bs_buf, &enc_result);
+	ctx->active_dst = NULL;
 
 	if (ret) {
 		vb2_set_plane_payload(&dst_buf->vb2_buf, 0, 0);
@@ -1055,7 +1116,7 @@ static int mtk_venc_param_change(struct mtk_vcodec_enc_ctx *ctx)
 	int ret = 0;
 
 	/* Don't upcast the empty flush buffer */
-	if (vb2_v4l2 == &ctx->empty_flush_buf.vb)
+	if (!vb2_v4l2 || vb2_v4l2 == &ctx->empty_flush_buf.vb)
 		return 0;
 
 	mtk_buf = container_of(vb2_v4l2, struct mtk_video_enc_buf, m2m_buf.vb);
@@ -1086,6 +1147,11 @@ static int mtk_venc_param_change(struct mtk_vcodec_enc_ctx *ctx)
 		ret |= venc_if_set_param(ctx,
 					 VENC_SET_PARAM_GOP_SIZE,
 					 &enc_prm);
+	}
+	if (!ret && ctx->dev->venc_pdata->uses_vcp &&
+	    mtk_buf->param_change & MTK_ENCODE_PARAM_INTRA_PERIOD) {
+		enc_prm.intra_period = mtk_buf->enc_params.intra_period;
+		ret = venc_if_set_param(ctx, VENC_SET_PARAM_INTRA_PERIOD, &enc_prm);
 	}
 	if (!ret && mtk_buf->param_change & MTK_ENCODE_PARAM_FORCE_INTRA) {
 		mtk_v4l2_venc_dbg(1, ctx, "[%d] id=%d, change param force I=%d",
@@ -1138,6 +1204,15 @@ static void mtk_venc_worker(struct work_struct *work)
 	}
 
 	src_buf = v4l2_m2m_src_buf_remove(ctx->m2m_ctx);
+	if (!src_buf) {
+		ctx->state = MTK_STATE_ABORT;
+		vb2_set_plane_payload(&dst_buf->vb2_buf, 0, 0);
+		v4l2_m2m_buf_done(dst_buf, VB2_BUF_STATE_ERROR);
+		vb2_queue_error(&ctx->m2m_ctx->out_q_ctx.q);
+		vb2_queue_error(&ctx->m2m_ctx->cap_q_ctx.q);
+		v4l2_m2m_job_finish(ctx->dev->m2m_dev_enc, ctx->m2m_ctx);
+		return;
+	}
 
 	/*
 	 * If we see the flush buffer, send an empty buffer with the LAST flag
@@ -1145,6 +1220,20 @@ static void mtk_venc_worker(struct work_struct *work)
 	 * is dequeued.
 	 */
 	if (src_buf == &ctx->empty_flush_buf.vb) {
+		if (ctx->dev->venc_pdata->uses_vcp) {
+			ret = venc_if_encode(ctx, VENC_START_OPT_ENCODE_FRAME_FINAL,
+					     NULL, NULL, &enc_result);
+			if (ret) {
+				ctx->state = MTK_STATE_ABORT;
+				vb2_set_plane_payload(&dst_buf->vb2_buf, 0, 0);
+				v4l2_m2m_buf_done(dst_buf, VB2_BUF_STATE_ERROR);
+				vb2_queue_error(&ctx->m2m_ctx->out_q_ctx.q);
+				vb2_queue_error(&ctx->m2m_ctx->cap_q_ctx.q);
+				v4l2_m2m_job_finish(ctx->dev->m2m_dev_enc,
+						    ctx->m2m_ctx);
+				return;
+			}
+		}
 		vb2_set_plane_payload(&dst_buf->vb2_buf, 0, 0);
 		dst_buf->flags |= V4L2_BUF_FLAG_LAST;
 		v4l2_m2m_buf_done(dst_buf, VB2_BUF_STATE_DONE);
@@ -1161,6 +1250,8 @@ static void mtk_venc_worker(struct work_struct *work)
 	bs_buf.va = vb2_plane_vaddr(&dst_buf->vb2_buf, 0);
 	bs_buf.dma_addr = vb2_dma_contig_plane_dma_addr(&dst_buf->vb2_buf, 0);
 	bs_buf.size = (size_t)dst_buf->vb2_buf.planes[0].length;
+	ctx->active_src = &src_buf->vb2_buf;
+	ctx->active_dst = &dst_buf->vb2_buf;
 
 	mtk_v4l2_venc_dbg(2, ctx,
 			  "Framebuf PA=%llx Size=0x%zx;PA=0x%llx Size=0x%zx;PA=0x%llx Size=%zu",
@@ -1170,6 +1261,8 @@ static void mtk_venc_worker(struct work_struct *work)
 
 	ret = venc_if_encode(ctx, VENC_START_OPT_ENCODE_FRAME,
 			     &frm_buf, &bs_buf, &enc_result);
+	ctx->active_src = NULL;
+	ctx->active_dst = NULL;
 
 	dst_buf->vb2_buf.timestamp = src_buf->vb2_buf.timestamp;
 	dst_buf->timecode = src_buf->timecode;
@@ -1182,7 +1275,7 @@ static void mtk_venc_worker(struct work_struct *work)
 		vb2_set_plane_payload(&dst_buf->vb2_buf, 0, 0);
 		v4l2_m2m_buf_done(dst_buf, VB2_BUF_STATE_ERROR);
 		mtk_v4l2_venc_err(ctx, "venc_if_encode failed=%d", ret);
-	} else {
+	} else if (!enc_result.async) {
 		v4l2_m2m_buf_done(src_buf, VB2_BUF_STATE_DONE);
 		vb2_set_plane_payload(&dst_buf->vb2_buf, 0, enc_result.bs_size);
 		v4l2_m2m_buf_done(dst_buf, VB2_BUF_STATE_DONE);
@@ -1191,25 +1284,34 @@ static void mtk_venc_worker(struct work_struct *work)
 	}
 
 	v4l2_m2m_job_finish(ctx->dev->m2m_dev_enc, ctx->m2m_ctx);
-
-	mtk_v4l2_venc_dbg(1, ctx, "<=== src_buf[%d] dst_buf[%d] venc_if_encode ret=%d Size=%u===>",
-			  src_buf->vb2_buf.index, dst_buf->vb2_buf.index, ret, enc_result.bs_size);
 }
 
 static void m2mops_venc_device_run(void *priv)
 {
 	struct mtk_vcodec_enc_ctx *ctx = priv;
+	int ret;
+
+	ret = mtk_venc_param_change(ctx);
+	if (ret)
+		goto abort;
 
 	if ((ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_H264) &&
 	    (ctx->state != MTK_STATE_HEADER)) {
 		/* encode h264 sps/pps header */
-		mtk_venc_encode_header(ctx);
+		ret = mtk_venc_encode_header(ctx);
+		if (ret)
+			goto abort;
 		queue_work(ctx->dev->encode_workqueue, &ctx->encode_work);
 		return;
 	}
 
-	mtk_venc_param_change(ctx);
 	queue_work(ctx->dev->encode_workqueue, &ctx->encode_work);
+	return;
+abort:
+	ctx->state = MTK_STATE_ABORT;
+	vb2_queue_error(&ctx->m2m_ctx->out_q_ctx.q);
+	vb2_queue_error(&ctx->m2m_ctx->cap_q_ctx.q);
+	v4l2_m2m_job_finish(ctx->dev->m2m_dev_enc, ctx->m2m_ctx);
 }
 
 static int m2mops_venc_job_ready(void *m2m_priv)
@@ -1228,7 +1330,14 @@ static void m2mops_venc_job_abort(void *priv)
 {
 	struct mtk_vcodec_enc_ctx *ctx = priv;
 
-	ctx->state = MTK_STATE_ABORT;
+	/* VCP submissions finish the m2m job before their asynchronous buffer
+	 * completion arrives. A STREAMOFF can therefore cancel a still-running
+	 * synchronous job while the other queue remains active; leave the state
+	 * intact so that queue restart can re-enter start_streaming(). Actual VCP
+	 * failures set ABORT at their error site.
+	 */
+	if (!ctx->dev->venc_pdata->uses_vcp)
+		ctx->state = MTK_STATE_ABORT;
 }
 
 const struct v4l2_m2m_ops mtk_venc_m2m_ops = {
@@ -1296,10 +1405,15 @@ void mtk_vcodec_enc_set_default_params(struct mtk_vcodec_enc_ctx *ctx)
 
 	ctx->enc_params.framerate_num = MTK_DEFAULT_FRAMERATE_NUM;
 	ctx->enc_params.framerate_denom = MTK_DEFAULT_FRAMERATE_DENOM;
+	if (ctx->dev->venc_pdata->uses_vcp) {
+		ctx->enc_params.framerate_num = MTK_DEFAULT_FRAMERATE_DENOM;
+		ctx->enc_params.framerate_denom = MTK_DEFAULT_FRAMERATE_NUM;
+	}
 }
 
 int mtk_vcodec_enc_ctrls_setup(struct mtk_vcodec_enc_ctx *ctx)
 {
+	bool vcp = ctx->dev->venc_pdata->uses_vcp;
 	const struct v4l2_ctrl_ops *ops = &mtk_vcodec_enc_ctrl_ops;
 	struct v4l2_ctrl_handler *handler = &ctx->ctrl_hdl;
 	u8 h264_max_level;
@@ -1317,9 +1431,9 @@ int mtk_vcodec_enc_ctrls_setup(struct mtk_vcodec_enc_ctx *ctx)
 			  ctx->dev->venc_pdata->min_bitrate,
 			  ctx->dev->venc_pdata->max_bitrate, 1, 4000000);
 	v4l2_ctrl_new_std(handler, ops, V4L2_CID_MPEG_VIDEO_B_FRAMES,
-			0, 2, 1, 0);
+			0, vcp ? 0 : 2, 1, 0);
 	v4l2_ctrl_new_std(handler, ops, V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE,
-			0, 1, 1, 1);
+			vcp ? 1 : 0, 1, 1, 1);
 	v4l2_ctrl_new_std(handler, ops, V4L2_CID_MPEG_VIDEO_H264_MAX_QP,
 			0, 51, 1, 51);
 	v4l2_ctrl_new_std(handler, ops, V4L2_CID_MPEG_VIDEO_H264_I_PERIOD,
@@ -1327,7 +1441,7 @@ int mtk_vcodec_enc_ctrls_setup(struct mtk_vcodec_enc_ctx *ctx)
 	v4l2_ctrl_new_std(handler, ops, V4L2_CID_MPEG_VIDEO_GOP_SIZE,
 			0, 65535, 1, 0);
 	v4l2_ctrl_new_std(handler, ops, V4L2_CID_MPEG_VIDEO_MB_RC_ENABLE,
-			0, 1, 1, 0);
+			0, vcp ? 0 : 1, 1, 0);
 	v4l2_ctrl_new_std(handler, ops, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME,
 			0, 0, 0, 0);
 	v4l2_ctrl_new_std_menu(handler, ops,
@@ -1343,8 +1457,9 @@ int mtk_vcodec_enc_ctrls_setup(struct mtk_vcodec_enc_ctx *ctx)
 	v4l2_ctrl_new_std_menu(handler, ops, V4L2_CID_MPEG_VIDEO_H264_LEVEL,
 			       h264_max_level,
 			       0, V4L2_MPEG_VIDEO_H264_LEVEL_4_0);
-	v4l2_ctrl_new_std_menu(handler, ops, V4L2_CID_MPEG_VIDEO_VP8_PROFILE,
-			       V4L2_MPEG_VIDEO_VP8_PROFILE_0, 0, V4L2_MPEG_VIDEO_VP8_PROFILE_0);
+	if (!vcp)
+		v4l2_ctrl_new_std_menu(handler, ops, V4L2_CID_MPEG_VIDEO_VP8_PROFILE,
+			V4L2_MPEG_VIDEO_VP8_PROFILE_0, 0, V4L2_MPEG_VIDEO_VP8_PROFILE_0);
 	v4l2_ctrl_new_std_menu(handler, ops, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
 			       V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
 			       ~(1 << V4L2_MPEG_VIDEO_BITRATE_MODE_CBR),
@@ -1374,6 +1489,8 @@ int mtk_vcodec_enc_queue_init(void *priv, struct vb2_queue *src_vq,
 	 */
 	src_vq->type		= V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	src_vq->io_modes	= VB2_DMABUF | VB2_MMAP | VB2_USERPTR;
+	if (ctx->dev->venc_pdata->uses_vcp)
+		src_vq->io_modes &= ~VB2_USERPTR;
 	src_vq->drv_priv	= ctx;
 	src_vq->buf_struct_size = sizeof(struct mtk_video_enc_buf);
 	src_vq->ops		= &mtk_venc_vb2_ops;
@@ -1388,6 +1505,8 @@ int mtk_vcodec_enc_queue_init(void *priv, struct vb2_queue *src_vq,
 
 	dst_vq->type		= V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	dst_vq->io_modes	= VB2_DMABUF | VB2_MMAP | VB2_USERPTR;
+	if (ctx->dev->venc_pdata->uses_vcp)
+		dst_vq->io_modes &= ~VB2_USERPTR;
 	dst_vq->drv_priv	= ctx;
 	dst_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
 	dst_vq->ops		= &mtk_venc_vb2_ops;
