@@ -3064,10 +3064,17 @@ block_size = <0x1000>;
 
 			port {
 				dsi_out: endpoint {
-					remote-endpoint = <&panel_ep>;
+					remote-endpoint = <&panel42_ep>;
 				};
 			};
 
+			/*
+			 * This handset was built with either of two DSI
+			 * panels.  The DSI output points at the one that
+			 * matches the module actually fitted; the inactive
+			 * node below is kept disabled and unlinked, and a
+			 * board that carries it switches the two over.
+			 */
 			panel@1 {
 				compatible = "l16_36_02_0b_dsc_vdo,lcm";
 				reg = <1>;
@@ -3077,9 +3084,28 @@ block_size = <0x1000>;
 				dvdd-gpios = <&pio 118 GPIO_ACTIVE_HIGH>;
 				vrf18-supply = <&vrf18_reg>;
 				backlight = <&gate_ic>;
+				status = "disabled";
 
 				port {
 					panel_ep: endpoint {
+						/* Linked by the board that uses it. */
+					};
+				};
+			};
+
+			panel@0 {
+				compatible = "l16_42_02_0a_dsc_vdo,lcm";
+				reg = <0>;
+				reset-gpios = <&pio 41 GPIO_ACTIVE_HIGH>;
+				leden-gpios = <&pio 215 GPIO_ACTIVE_HIGH>;
+				cam-gpios = <&pio 158 GPIO_ACTIVE_HIGH>;
+				dvdd-gpios = <&pio 118 GPIO_ACTIVE_HIGH>;
+				vrf18-supply = <&vrf18_reg>;
+				backlight = <&gate_ic>;
+				status = "okay";
+
+				port {
+					panel42_ep: endpoint {
 						remote-endpoint = <&dsi_out>;
 					};
 				};

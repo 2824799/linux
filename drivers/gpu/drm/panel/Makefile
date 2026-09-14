@@ -144,9 +144,21 @@ mediatek-drm-panel-drv-y := \
 
 obj-$(CONFIG_DRM_MEDIATEK_PANEL) += mediatek-drm-panel-drv.o
 obj-$(CONFIG_DRM_PANEL_L16_36_02_0B_DSC_VDO) += panel-l16-36-02-0b-dsc-vdo.o
+obj-$(CONFIG_DRM_PANEL_L16_42_02_0A_DSC_VDO) += panel-l16-42-02-0a-dsc-vdo.o
 obj-$(CONFIG_DRM_PANEL_LEDS_KTZ8863A) += leds-ktz8863a.o
 
 ccflags-$(CONFIG_DRM_MEDIATEK_PANEL) += -I$(srctree)/drivers/leds/
+ccflags-$(CONFIG_DRM_PANEL_L16_42_02_0A_DSC_VDO) += \
+	-I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/ \
+	-I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/mi_disp/ \
+	-I$(srctree)/drivers/misc/mediatek/mmp/ \
+	-I$(srctree)/drivers/misc/mediatek/cmdq/mailbox/ \
+	-I$(srctree)/drivers/misc/mediatek/iommu/ \
+	-I$(srctree)/drivers/misc/mediatek/vcp/include/ \
+	-I$(srctree)/drivers/misc/mediatek/mtk-interconnect/ \
+	-I$(srctree)/drivers/misc/mediatek/slbc/ \
+	-I$(srctree)/drivers/misc/mediatek/clkbuf/v1/inc/ \
+	-I$(srctree)/drivers/misc/mediatek/include/ \
 ccflags-$(CONFIG_DRM_PANEL_L16_36_02_0B_DSC_VDO) += \
 	-I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/ \
 	-I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/mi_disp/ \
