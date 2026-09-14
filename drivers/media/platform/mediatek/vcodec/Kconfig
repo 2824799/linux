@@ -9,6 +9,7 @@ config VIDEO_MEDIATEK_VCP
 	  Vendor encoder RPC and buffer lifecycle support for MT6895 VCP.
 	  This protocol backend requires a hardware resource adapter and a
 	  V4L2 frontend; enabling it alone does not create a video device.
+	  Firmware accesses private coherent buffers supplied by this backend.
 
 config VIDEO_MEDIATEK_VCP_DEC
 	tristate "MediaTek MT6895 VCP H.264 decoder"
@@ -20,6 +21,7 @@ config VIDEO_MEDIATEK_VCP_DEC
 	  Stateful decoder firmware commands, separate frame resource service,
 	  and display/reference/bitstream buffer ownership for MT6895 VCP.
 	  Exposes a stateful V4L2 H.264 decoder with NV12M capture buffers.
+	  Firmware reference frames are converted from MM21 in software.
 
 config VIDEO_MEDIATEK_VCODEC_SCP
 	bool

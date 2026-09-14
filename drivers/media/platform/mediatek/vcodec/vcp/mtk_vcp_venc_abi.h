@@ -31,7 +31,8 @@ enum vcp_venc_query_id {
 };
 
 /* These are copied from the vendor wire ABI. Do not use the mainline
- * VIDEO_MAX_FRAME value here: the firmware table has 64 entries. */
+ * VIDEO_MAX_FRAME value here: the firmware table has 64 entries.
+ */
 struct vcp_venc_video_format {
 	__le32 fourcc;
 	__le32 type;

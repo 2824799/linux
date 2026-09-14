@@ -31,7 +31,8 @@ struct vcp_venc_dma_buffer {
 };
 
 /* Firmware receives only private coherent storage. An unconfirmed stop
- * retains that storage, never DMA access to reusable userspace buffers. */
+ * retains that storage, never DMA access to reusable userspace buffers.
+ */
 struct vcp_venc_dma_buffer *vcp_venc_dma_stage(struct device *dev,
 	struct vb2_buffer *vb, enum dma_data_direction direction);
 int vcp_venc_dma_copy_output(struct vcp_venc_dma_buffer *buffer, u32 bytes);

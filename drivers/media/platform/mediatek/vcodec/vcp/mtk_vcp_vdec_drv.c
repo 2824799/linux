@@ -340,7 +340,8 @@ static int queue_surfaces(struct vdec_ctx *c)
 			continue;
 		s->free = false;
 		s->cookie = ++c->next_cookie;
-		ret = mtk_vcp_vdec_frame(c->decoder, s->cookie, i, s->plane[0].dma, s->plane[1].dma);
+		ret = mtk_vcp_vdec_frame(c->decoder, s->cookie, i,
+					 s->plane[0].dma, s->plane[1].dma);
 		if (ret)
 			return ret;
 	}
@@ -783,7 +784,8 @@ static int queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *dst)
 
 	for (i = 0; i < 2; i++) {
 		q = i ? dst : src;
-		q->type = i ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+		q->type = i ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
+			      V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 		q->io_modes = VB2_MMAP;
 		q->drv_priv = c;
 		q->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
@@ -981,7 +983,8 @@ static const struct v4l2_ioctl_ops ioctl_ops = {
 	.vidioc_dqbuf = v4l2_m2m_ioctl_dqbuf, .vidioc_expbuf = v4l2_m2m_ioctl_expbuf,
 	.vidioc_streamon = v4l2_m2m_ioctl_streamon, .vidioc_streamoff = v4l2_m2m_ioctl_streamoff,
 	.vidioc_decoder_cmd = decoder_cmd, .vidioc_try_decoder_cmd = v4l2_m2m_ioctl_try_decoder_cmd,
-	.vidioc_subscribe_event = subscribe_event, .vidioc_unsubscribe_event = v4l2_event_unsubscribe,
+	.vidioc_subscribe_event = subscribe_event,
+	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 };
 
 static int vdec_open(struct file *file)
@@ -1196,7 +1199,11 @@ static const struct of_device_id dma_match[] = {
 MODULE_DEVICE_TABLE(of, dma_match);
 static struct platform_driver dma_driver = {
 	.probe = dma_probe,
-	.driver = { .name = "mtk-vcp-vdec-dma", .of_match_table = dma_match, .suppress_bind_attrs = true },
+	.driver = {
+		.name = "mtk-vcp-vdec-dma",
+		.of_match_table = dma_match,
+		.suppress_bind_attrs = true,
+	},
 };
 static int __init vdec_init(void)
 {
