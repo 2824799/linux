@@ -1923,7 +1923,7 @@ mtk_iommu_tlb_flush_range_sync(gather->start, length, gather->pgsize,
 }
 
 static int mtk_iommu_sync_map(struct iommu_domain *domain, unsigned long iova,
-                            size_t size)
+			    size_t size)
 {
 	struct mtk_iommu_domain *dom = to_mtk_domain(domain);
 	int ret;

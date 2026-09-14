@@ -204,7 +204,7 @@ static int venc_memory_service(struct mtk_vcp_venc_inst *inst,
 	if (inst->allocation_count >= VCP_VENC_MAX_ALLOCATIONS ||
 	    size > VCP_VENC_MAX_WORK_BYTES - inst->work_bytes)
 		return -ENOMEM;
-	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
+	buf = kzalloc_obj(*buf);
 	if (!buf)
 		return -ENOMEM;
 	ret = enc->ops->alloc(enc->priv, type, size, &buf->mem);
@@ -284,7 +284,8 @@ static int venc_service(struct mtk_vcp_venc_inst *inst, u32 id,
 			if (core < 0 || core > 1 || !(inst->cores & BIT(core)))
 				ret = -EINVAL;
 			else
-				ret = enc->ops->wait_irq(enc->priv, inst->cookie, core, &irq_status);
+				ret = enc->ops->wait_irq(enc->priv, inst->cookie,
+							core, &irq_status);
 			response.hw.codec_or_irq = cpu_to_le32(irq_status);
 			response.hw.timeout = cpu_to_le32(!!ret);
 			dev_info(enc->dev,
@@ -452,7 +453,7 @@ struct mtk_vcp_venc *mtk_vcp_venc_create(struct device *dev,
 	if (!dev || !bitstream_dev || !vcp || !ops || !ops->power ||
 	    !ops->wait_irq || !ops->alloc || !ops->free || !ops->buffers_ready)
 		return ERR_PTR(-EINVAL);
-	enc = kzalloc(sizeof(*enc), GFP_KERNEL);
+	enc = kzalloc_obj(*enc);
 	if (!enc)
 		return ERR_PTR(-ENOMEM);
 	enc->dev = dev;
@@ -476,7 +477,7 @@ struct mtk_vcp_venc_inst *mtk_vcp_venc_new(struct mtk_vcp_venc *enc)
 {
 	struct mtk_vcp_venc_inst *inst;
 
-	inst = kzalloc(sizeof(*inst), GFP_KERNEL);
+	inst = kzalloc_obj(*inst);
 	if (!inst)
 		return ERR_PTR(-ENOMEM);
 	inst->enc = enc;
@@ -1019,7 +1020,8 @@ int mtk_vcp_venc_submit_vb2(struct mtk_vcp_venc_inst *inst, unsigned int mode,
 	inst->buffer_count += count;
 	inst->managed_buffers = true;
 	/* Firmware may return a buffer before the send call returns. Link the
-	 * ownership records before issuing the RPC so that return is matchable. */
+	 * ownership records before issuing the RPC so that return is matchable.
+	 */
 	ret = venc_submit(inst, mode, &frame, &tracked);
 	if (!tracked) {
 		if (src)
@@ -1032,7 +1034,8 @@ int mtk_vcp_venc_submit_vb2(struct mtk_vcp_venc_inst *inst, unsigned int mode,
 		goto release;
 	}
 	/* dequeue is serialized by api_lock, including when PUT_BUFFER arrived
-	 * before the ENCODE ACK. Never expose vb2 pointers to the IRQ thread. */
+	 * before the ENCODE ACK. Never expose vb2 pointers to the IRQ thread.
+	 */
 	ids->frame = frame.frame_cookie;
 	ids->bitstream = frame.bitstream_cookie;
 	goto out;

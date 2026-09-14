@@ -51,7 +51,7 @@ struct mtk_vcp_venc_hw {
 	struct regulator *vcore;
 	unsigned long perf_rate;
 	struct mutex lock;
-	void (*notify)(void *, u64);
+	void (*notify)(void *priv, u64 cookie);
 	void *notify_priv;
 	bool powered;
 };

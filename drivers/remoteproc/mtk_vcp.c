@@ -454,7 +454,8 @@ static int vcp_load(struct rproc *rproc, const struct firmware *fw)
 
 	/* Secure reset closes DAPC access to VCP SRAM. The bootloader-owned
 	 * image is not replaced between remoteproc boots, so verify its live
-	 * metadata once while SRAM is accessible and retain that result. */
+	 * metadata once while SRAM is accessible and retain that result.
+	 */
 	if (vcp->sram_metadata_verified)
 		return 0;
 
@@ -471,7 +472,8 @@ static int vcp_load(struct rproc *rproc, const struct firmware *fw)
 	    !vcp_code_range(info.dram_backup_start, info.dram_size))
 		goto out;
 	/* The bootloader owns the RISC-V image; never copy or compare the ELF
-	 * file against SRAM. Only the live SRAM metadata is trusted here. */
+	 * file against SRAM. Only the live SRAM metadata is trusted here.
+	 */
 	dev_info(vcp->dev, "verified VCP SRAM metadata for bootloader-owned RISC-V image\n");
 	vcp->sram_metadata_verified = true;
 	ret = 0;
@@ -734,6 +736,7 @@ static int vcp_ipi_send(struct mtk_vcp *vcp, unsigned int codec,
 	if (ret)
 		goto out;
 	memcpy_toio(base, &msg, sizeof(msg));
+	/* Publish the mailbox payload before ringing the doorbell. */
 	wmb();
 	writel(BIT(0), base + VCP_MBOX_SET);
 	/* Transport receipt only; the codec backend must match the real RPC reply. */
