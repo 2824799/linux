@@ -37,7 +37,14 @@ extern int ktz8863a_brightness_off(void);
 #include <linux/i2c-dev.h>
 #include <linux/i2c.h>
 extern int get_panel_dead_flag(void);
-static const char *panel_name = "panel_name=dsi_l16_36_02_0b_dsc_vdo";
+/*
+ * The handset was built with either an L16_36 or an L16_42 DSI module.
+ * The two are electrically interchangeable: the same init sequence, timings,
+ * DSC configuration, GPIOs and supply.  One driver therefore serves both and
+ * neither needs to know which module it is driving, so the name reported to
+ * userspace is the generic one.
+ */
+static const char *panel_name = "panel_name=dsi_l16_dsc_vdo";
 static char led_wp_info_str[64] = {0};
 extern int ktz8863a_bl_bias_conf(void);
 extern int ktz8863a_bias_enable(int enable);
@@ -1379,7 +1386,7 @@ static int lcm_probe(struct mipi_dsi_device *dsi)
 	struct device_node *dsi_node, *remote_node = NULL, *endpoint = NULL;
 	struct lcm *ctx;
 	int ret;
-	pr_debug("l16_36_02_0b_dsc_vdo %s+\n", __func__);
+	pr_debug("xiaomi-l16-dsc-vdo %s+\n", __func__);
 	dsi_node = of_get_parent(dev->of_node);
 	if (dsi_node) {
 		endpoint = of_graph_get_next_endpoint(dsi_node, NULL);
@@ -1477,7 +1484,7 @@ static int lcm_probe(struct mipi_dsi_device *dsi)
 	if (ret < 0)
 		return ret;
 #endif
-	pr_debug("l16_36_02_0b_dsc_vdo %s-\n", __func__);
+	pr_debug("xiaomi-l16-dsc-vdo %s-\n", __func__);
 	return ret;
 }
 static void lcm_remove(struct mipi_dsi_device *dsi)
@@ -1494,7 +1501,14 @@ static void lcm_remove(struct mipi_dsi_device *dsi)
 #endif
 }
 static const struct of_device_id lcm_of_match[] = {
+	{ .compatible = "xiaomi,l16-dsc-vdo,lcm", },
+	/*
+	 * The stock names of both modules.  The handset was built with either an
+	 * L16_36 or an L16_42 module and the two take identical panel data, so a
+	 * board that still points its DSI output at one of them keeps working.
+	 */
 	{ .compatible = "l16_36_02_0b_dsc_vdo,lcm", },
+	{ .compatible = "l16_42_02_0a_dsc_vdo,lcm", },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, lcm_of_match);
@@ -1502,14 +1516,15 @@ static struct mipi_dsi_driver lcm_driver = {
 	.probe = lcm_probe,
 	.remove = lcm_remove,
 	.driver = {
-		.name = "l16_36_02_0b_dsc_vdo,lcm",
+		.name = "xiaomi,l16-dsc-vdo,lcm",
 		.owner = THIS_MODULE,
 		.of_match_table = lcm_of_match,
 	},
 };
 module_param_string(WpAndMaxlum, led_wp_info_str, sizeof(led_wp_info_str), 0600);
-MODULE_PARM_DESC(WpAndMaxlum, "panel-l16-36-02-0b-dsc-vdo.WpAndMaxlum=<WpAndMaxlum> while <WpAndMaxlum> is 'WpAndMaxlum' ");
+MODULE_PARM_DESC(WpAndMaxlum, "panel-xiaomi-l16-dsc-vdo.WpAndMaxlum=<WpAndMaxlum> while <WpAndMaxlum> is 'WpAndMaxlum' ");
 module_mipi_dsi_driver(lcm_driver);
 MODULE_AUTHOR("Liu Jing <liujing30@xiaomi.com>");
-MODULE_DESCRIPTION("L16 36 02 0b dsc vdo lcd panel driver");
+MODULE_AUTHOR("Lang Lei <leilang1@xiaomi.com>");
+MODULE_DESCRIPTION("Xiaomi L16 handset DSI panel driver (L16_36 and L16_42 modules)");
 MODULE_LICENSE("GPL v2");

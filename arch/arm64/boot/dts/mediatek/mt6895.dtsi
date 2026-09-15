@@ -2926,8 +2926,14 @@ block_size = <0x1000>;
 				};
 			};
 
+			/*
+			 * The handset was built with either an L16_36 or an L16_42
+			 * DSI module.  The two are electrically interchangeable and
+			 * the driver serves both, so a single node covers a unit
+			 * carrying either of them.
+			 */
 			panel@1 {
-				compatible = "l16_36_02_0b_dsc_vdo,lcm";
+				compatible = "xiaomi,l16-dsc-vdo,lcm";
 				reg = <1>;
 				reset-gpios = <&pio 41 GPIO_ACTIVE_HIGH>;
 				leden-gpios = <&pio 215 GPIO_ACTIVE_HIGH>;

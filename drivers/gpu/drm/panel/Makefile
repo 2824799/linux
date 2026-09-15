@@ -143,11 +143,11 @@ mediatek-drm-panel-drv-y := \
 		  mtk_drm_panel_drv.o
 
 obj-$(CONFIG_DRM_MEDIATEK_PANEL) += mediatek-drm-panel-drv.o
-obj-$(CONFIG_DRM_PANEL_L16_36_02_0B_DSC_VDO) += panel-l16-36-02-0b-dsc-vdo.o
+obj-$(CONFIG_DRM_PANEL_XIAOMI_L16_DSC_VDO) += panel-xiaomi-l16-dsc-vdo.o
 obj-$(CONFIG_DRM_PANEL_LEDS_KTZ8863A) += leds-ktz8863a.o
 
 ccflags-$(CONFIG_DRM_MEDIATEK_PANEL) += -I$(srctree)/drivers/leds/
-ccflags-$(CONFIG_DRM_PANEL_L16_36_02_0B_DSC_VDO) += \
+ccflags-$(CONFIG_DRM_PANEL_XIAOMI_L16_DSC_VDO) += \
 	-I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/ \
 	-I$(srctree)/drivers/gpu/drm/mediatek/mediatek_v2/mi_disp/ \
 	-I$(srctree)/drivers/misc/mediatek/mmp/ \
