@@ -430,14 +430,22 @@ static int mt6895_mm_init(struct device *dev, struct mt6895_mm **result,
 	}
 
 	/*
-	 * The parent seeds the highest request before starting DVFSRC. The
-	 * confirmation poll can time out while another requester holds the rail,
-	 * which is not a handover failure: the board floor already covers the
-	 * boot rate of every mux below, so the handover still continues.
+	 * Move the muxes only once the rail has been confirmed at the step they
+	 * are being moved to.  The wait accepts a rail that is already at or
+	 * above the request, so a timeout means the collector could not be
+	 * observed serving this step, and re-parenting on top of that is how a
+	 * shared rail ends up carrying clocks it has no voltage for.  Keep the
+	 * boot clocks instead and let the voltage-only path derive the floor
+	 * that covers them.
 	 */
 	ret = mt6895_mm_voltage(mm, MTK_MM_STEPS - 1);
-	if (ret)
-		dev_warn(dev, "VCORE handover request not confirmed: %d\n", ret);
+	if (ret) {
+		dev_warn(dev,
+			 "VCORE handover to step %u not confirmed: %d, voltage only\n",
+			 MTK_MM_STEPS - 1, ret);
+		ret = -EOPNOTSUPP;
+		goto err;
+	}
 	/*
 	 * Keep bootloader display roots running across handover. Engine gates
 	 * remain runtime managed; root gating needs separate coordination.
