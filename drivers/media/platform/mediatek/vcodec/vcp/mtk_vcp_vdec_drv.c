@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Stateful V4L2 H.264 decoding through the MT6895 VCP firmware. */
+/* Stateful V4L2 decoding through the MT6895 VCP firmware. */
 #include <linux/atomic.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
@@ -25,6 +25,75 @@
 static bool vdec_caps_dump;
 module_param_named(caps_dump, vdec_caps_dump, bool, 0644);
 MODULE_PARM_DESC(caps_dump, "dump the firmware decoder capability tables on session boot");
+
+/* The formats and frame size limits the MT6895 VCP firmware publishes through
+ * VCP_VDEC_AP_QUERY_CAP, restricted to the ones this frontend can drive.
+ *
+ * The firmware lists ten input formats (H.264, H.265, HEIF, MPEG2, MPEG4,
+ * H.263, VP8, VP9, AV1 and VC-1), but it does not serve all of them through
+ * the interface this frontend implements. It reports the driving model in
+ * vsi->input_driven: 2 (INPUT_DRIVEN_PUT_FRM) is the one the frontend submits
+ * work in, 0 (NON_INPUT_DRIVEN) is not. Measured on MT6895:
+ *
+ *   H.264, H.265  input_driven 2; decode is pixel-identical to a reference
+ *                 decode of the same stream
+ *   VP9           input_driven 2; the luma plane is pixel-identical but the
+ *                 firmware leaves the chroma plane blank
+ *   VP8, MPEG2,
+ *   MPEG4         input_driven 0
+ *   AV1           no picture; the remoteproc watchdog resets the VCP core
+ *   VC-1          published without a frame size range
+ *
+ * A stream the firmware cannot handle does not fail cleanly: it stops
+ * answering and the watchdog resets the core, which leaves the frontend
+ * holding a session whose DMA cannot be released. Only the formats below are
+ * therefore advertised, so a client cannot reach the failing paths through
+ * s_fmt and the next session starts on a healthy core.
+ *
+ * fourcc is the V4L2 format the frontend offers, vcp_fourcc is how the same
+ * codec is spelled in the firmware tables, codec_id is the value the
+ * VCP_VDEC_CHECK_CODEC_ID handshake carries, and size is the range the
+ * firmware publishes for it.
+ */
+struct vdec_codec {
+	u32 fourcc;
+	u32 vcp_fourcc;
+	u32 codec_id;
+	struct v4l2_frmsize_stepwise size;
+};
+
+static const struct vdec_codec vdec_codecs[] = {
+	{ V4L2_PIX_FMT_H264, v4l2_fourcc('H', '2', '6', '4'), VCP_VDEC_H264,
+	  { 16, 4096, 16, 16, 2176, 16 } },
+	{ V4L2_PIX_FMT_HEVC, v4l2_fourcc('H', '2', '6', '5'), VCP_VDEC_H265,
+	  { 16, 4096, 16, 16, 2176, 16 } },
+};
+
+static const struct vdec_codec *vdec_codec_by_fourcc(u32 fourcc)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(vdec_codecs); i++)
+		if (vdec_codecs[i].fourcc == fourcc)
+			return &vdec_codecs[i];
+	return NULL;
+}
+
+/* CAPTURE geometry follows whatever the decoded stream turns out to be, so it
+ * accepts the union of the ranges the supported codecs publish.
+ */
+static const struct v4l2_frmsize_stepwise vdec_capture_size = {
+	16, 4096, 16, 16, 2176, 16,
+};
+
+/* Round a requested dimension down to a step the firmware accepts, inside the
+ * range the codec publishes.
+ */
+static u32 vdec_dimension(u32 v, u32 min, u32 max, u32 step)
+{
+	v = clamp_t(u32, v, min, max);
+	return v / step * step;
+}
 
 struct vdec_ctx;
 struct vdec_dev {
@@ -53,6 +122,7 @@ struct vdec_ctx {
 	struct vdec_dev *dev;
 	struct mtk_vcp_vdec *decoder;
 	struct v4l2_pix_format_mplane src_fmt, dst_fmt;
+	u32 codec_id;
 	struct vcp_vdec_picture pic;
 	struct mtk_vcp_mem bs;
 	struct vdec_surface surfaces[DEC_SURFACES];
@@ -154,49 +224,78 @@ static const struct mtk_vcp_vdec_ops codec_ops = {
 
 static int session_teardown(struct vdec_ctx *c);
 
-/* One-shot bring-up probe: ask the firmware which formats and frame sizes
- * the decoder accepts, so the driver's static tables can be checked against
- * the firmware instead of against the vendor header.
+/* Ask the firmware which formats it can decode and refuse a session whose
+ * negotiated format is not among them. A stream the firmware cannot handle
+ * makes it stop answering and resets the VCP core, so the mismatch has to
+ * fail the session here instead of reaching the decoder.
  */
-static void vdec_dump_caps(struct vdec_ctx *c)
+static int vdec_check_caps(struct vdec_ctx *c)
 {
-	struct vcp_vdec_cap_format *fmts;
+	const struct vdec_codec *k = vdec_codec_by_fourcc(c->src_fmt.pixelformat);
 	struct vcp_vdec_cap_framesize *sizes;
+	struct vcp_vdec_cap_format *fmts;
+	bool found = false;
 	int ret, i;
 
+	if (!k)
+		return -EINVAL;
 	fmts = kzalloc(sizeof(*fmts) * VCP_VDEC_CAPS, GFP_KERNEL);
 	sizes = kzalloc(sizeof(*sizes) * VCP_VDEC_CAPS, GFP_KERNEL);
-	if (!fmts || !sizes)
+	if (!fmts || !sizes) {
+		ret = -ENOMEM;
 		goto out;
+	}
 	ret = mtk_vcp_vdec_query_cap(c->decoder, VCP_VDEC_CAP_SUPPORTED_FORMATS,
 				     fmts, sizeof(*fmts) * VCP_VDEC_CAPS);
 	if (ret) {
-		dev_warn(c->dev->dev, "VDEC caps query failed: %d\n", ret);
+		/* The query is advisory: keep a session the firmware cannot
+		 * describe, rather than refusing to decode at all.
+		 */
+		dev_warn(c->dev->dev, "VDEC format query failed: %d\n", ret);
+		ret = 0;
 		goto out;
 	}
-	for (i = 0; i < VCP_VDEC_CAPS && le32_to_cpu(fmts[i].fourcc); i++)
-		dev_info(c->dev->dev,
-			 "VDEC cap fmt[%d]: fourcc=%#x type=%u planes=%u\n", i,
-			 le32_to_cpu(fmts[i].fourcc), le32_to_cpu(fmts[i].type),
-			 le32_to_cpu(fmts[i].num_planes));
+	for (i = 0; i < VCP_VDEC_CAPS && le32_to_cpu(fmts[i].fourcc); i++) {
+		u32 fourcc = le32_to_cpu(fmts[i].fourcc);
+
+		if (vdec_caps_dump)
+			dev_info(c->dev->dev,
+				 "VDEC cap fmt[%d]: fourcc=%p4cc type=%u planes=%u\n", i,
+				 &fourcc, le32_to_cpu(fmts[i].type),
+				 le32_to_cpu(fmts[i].num_planes));
+		if (fourcc == k->vcp_fourcc)
+			found = true;
+	}
+	if (!found) {
+		dev_err(c->dev->dev,
+			"VDEC format %p4cc is not in the firmware format table\n",
+			&k->fourcc);
+		ret = -EINVAL;
+		goto out;
+	}
 	ret = mtk_vcp_vdec_query_cap(c->decoder, VCP_VDEC_CAP_FRAME_SIZES, sizes,
 				     sizeof(*sizes) * VCP_VDEC_CAPS);
 	if (ret) {
-		dev_warn(c->dev->dev, "VDEC frame sizes query failed: %d\n", ret);
+		dev_warn(c->dev->dev, "VDEC frame size query failed: %d\n", ret);
+		ret = 0;
 		goto out;
 	}
-	for (i = 0; i < VCP_VDEC_CAPS && le32_to_cpu(sizes[i].fourcc); i++)
+	for (i = 0; i < VCP_VDEC_CAPS && vdec_caps_dump &&
+	     le32_to_cpu(sizes[i].fourcc); i++)
 		dev_info(c->dev->dev,
-			 "VDEC cap size[%d]: fourcc=%#x profile=%u level=%u %ux%u..%ux%u\n",
-			 i, le32_to_cpu(sizes[i].fourcc),
-			 le32_to_cpu(sizes[i].profile), le32_to_cpu(sizes[i].level),
+			 "VDEC cap size[%d]: fourcc=%p4cc profile=%u level=%u %ux%u..%ux%u step %ux%u\n",
+			 i, &sizes[i].fourcc, le32_to_cpu(sizes[i].profile),
+			 le32_to_cpu(sizes[i].level),
 			 le32_to_cpu(sizes[i].stepwise.min_width),
 			 le32_to_cpu(sizes[i].stepwise.min_height),
 			 le32_to_cpu(sizes[i].stepwise.max_width),
-			 le32_to_cpu(sizes[i].stepwise.max_height));
+			 le32_to_cpu(sizes[i].stepwise.max_height),
+			 le32_to_cpu(sizes[i].stepwise.step_width),
+			 le32_to_cpu(sizes[i].stepwise.step_height));
 out:
 	kfree(fmts);
 	kfree(sizes);
+	return ret;
 }
 
 static int session_boot(struct vdec_ctx *c)
@@ -227,6 +326,15 @@ static int session_boot(struct vdec_ctx *c)
 	c->booted = true;
 	VCPDBG("boot: vcp running, offline=%d\n",
 	       mtk_vcp_is_offline(c->dev->vcp));
+	/* The firmware probes the codec of the session during INIT, so the id
+	 * the CHECK_CODEC_ID handshake expects has to be set first.
+	 */
+	ret = mtk_vcp_vdec_set_codec(c->decoder, c->codec_id);
+	if (ret) {
+		dev_info(c->dev->dev, "session codec %#x rejected: %d\n",
+			 c->codec_id, ret);
+		return ret;
+	}
 	ret = mtk_vcp_vdec_init(c->decoder);
 	if (ret) {
 		dev_info(c->dev->dev, "session init failed: %d\n", ret);
@@ -234,8 +342,9 @@ static int session_boot(struct vdec_ctx *c)
 		return ret;
 	}
 	c->initialized = true;
-	if (vdec_caps_dump)
-		vdec_dump_caps(c);
+	ret = vdec_check_caps(c);
+	if (ret)
+		goto rollback;
 	c->bs.size = c->src_fmt.plane_fmt[0].sizeimage;
 	c->bs.cpu = dma_alloc_coherent(c->dev->bs_dev, c->bs.size, &c->bs.dma, GFP_KERNEL);
 	VCPDBG("boot: bitstream mapping size=%zu cpu=%px dma=%pad\n",
@@ -244,16 +353,21 @@ static int session_boot(struct vdec_ctx *c)
 		vdec_state(c, "booted");
 		return 0;
 	}
-	/* A session without its bitstream buffer must not be left half
-	 * initialized: a later CAPTURE restart would otherwise reuse it and
-	 * write through the missing mapping.
+	ret = -ENOMEM;
+rollback:
+	/* A session without a usable bitstream mapping, or with a format the
+	 * firmware does not decode, must not be left half initialized: a later
+	 * CAPTURE restart would otherwise reuse it.
 	 */
-	ret = session_teardown(c);
-	if (ret)
-		return ret;
-	cmpxchg(&c->dev->ctx, c, NULL);
-	VCPDBG("boot: no bitstream mapping, session rolled back\n");
-	return -ENOMEM;
+	{
+		int err = session_teardown(c);
+
+		cmpxchg(&c->dev->ctx, c, NULL);
+		if (err)
+			return err;
+	}
+	VCPDBG("boot: rolled back, ret=%d\n", ret);
+	return ret;
 }
 
 static int session_start(struct vdec_ctx *c)
@@ -1312,7 +1426,7 @@ static int queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *dst)
 static int querycap(struct file *file, void *priv, struct v4l2_capability *cap)
 {
 	strscpy(cap->driver, "mtk-vcp-dec", sizeof(cap->driver));
-	strscpy(cap->card, "MT6895 VCP H.264 decoder", sizeof(cap->card));
+	strscpy(cap->card, "MT6895 VCP decoder", sizeof(cap->card));
 	strscpy(cap->bus_info, "platform:mt6895-vcp-dec", sizeof(cap->bus_info));
 	return 0;
 }
@@ -1321,9 +1435,9 @@ static int enum_format(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 	if (!valid_type(f->type))
 		return -EINVAL;
 	if (is_output(f->type)) {
-		if (f->index)
+		if (f->index >= ARRAY_SIZE(vdec_codecs))
 			return -EINVAL;
-		f->pixelformat = V4L2_PIX_FMT_H264;
+		f->pixelformat = vdec_codecs[f->index].fourcc;
 		return 0;
 	}
 	if (f->index == 0)
@@ -1357,16 +1471,30 @@ static int try_format(struct file *file, void *priv, struct v4l2_format *f)
 		picture_format(c, p);
 		return 0;
 	}
-	p->width = ALIGN(clamp_t(u32, p->width, 16, 4096), 16);
-	p->height = ALIGN(clamp_t(u32, p->height, 32, 2176), 32);
 	p->field = V4L2_FIELD_NONE;
 	memset(p->plane_fmt, 0, sizeof(p->plane_fmt));
 	memset(p->reserved, 0, sizeof(p->reserved));
 	if (is_output(f->type)) {
-		p->pixelformat = V4L2_PIX_FMT_H264;
+		const struct vdec_codec *k;
+
+		if (!p->pixelformat)
+			p->pixelformat = V4L2_PIX_FMT_H264;
+		k = vdec_codec_by_fourcc(p->pixelformat);
+		if (!k)
+			return -EINVAL;
+		p->width = vdec_dimension(p->width, k->size.min_width,
+					  k->size.max_width, k->size.step_width);
+		p->height = vdec_dimension(p->height, k->size.min_height,
+					   k->size.max_height, k->size.step_height);
 		p->num_planes = 1;
 		p->plane_fmt[0].sizeimage = clamp_t(u32, size ?: SZ_4M, SZ_64K, SZ_16M);
 	} else {
+		p->width = vdec_dimension(p->width, vdec_capture_size.min_width,
+					  vdec_capture_size.max_width,
+					  vdec_capture_size.step_width);
+		p->height = vdec_dimension(p->height, vdec_capture_size.min_height,
+					   vdec_capture_size.max_height,
+					   vdec_capture_size.step_height);
 		if (p->pixelformat != V4L2_PIX_FMT_NV12M &&
 		    p->pixelformat != V4L2_PIX_FMT_NV12)
 			p->pixelformat = V4L2_PIX_FMT_NV12M;
@@ -1401,6 +1529,9 @@ static int set_format(struct file *file, void *priv, struct v4l2_format *f)
 	if (!ret) {
 		*queue_format(c, f->type) = f->fmt.pix_mp;
 		if (is_output(f->type)) {
+			u32 fourcc = f->fmt.pix_mp.pixelformat;
+
+			c->codec_id = vdec_codec_by_fourcc(fourcc)->codec_id;
 			c->dst_fmt.colorspace = c->src_fmt.colorspace;
 			c->dst_fmt.xfer_func = c->src_fmt.xfer_func;
 			c->dst_fmt.ycbcr_enc = c->src_fmt.ycbcr_enc;
@@ -1434,12 +1565,21 @@ static int get_selection(struct file *file, void *priv, struct v4l2_selection *s
 }
 static int enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *s)
 {
-	if (s->index || (s->pixel_format != V4L2_PIX_FMT_H264 &&
-			 s->pixel_format != V4L2_PIX_FMT_NV12M &&
-			 s->pixel_format != V4L2_PIX_FMT_NV12))
+	const struct vdec_codec *k;
+
+	if (s->index)
+		return -EINVAL;
+	if (s->pixel_format == V4L2_PIX_FMT_NV12M ||
+	    s->pixel_format == V4L2_PIX_FMT_NV12) {
+		s->type = V4L2_FRMSIZE_TYPE_STEPWISE;
+		s->stepwise = vdec_capture_size;
+		return 0;
+	}
+	k = vdec_codec_by_fourcc(s->pixel_format);
+	if (!k)
 		return -EINVAL;
 	s->type = V4L2_FRMSIZE_TYPE_STEPWISE;
-	s->stepwise = (struct v4l2_frmsize_stepwise){ 16, 4096, 16, 32, 2176, 32 };
+	s->stepwise = k->size;
 	return 0;
 }
 static int subscribe_event(struct v4l2_fh *fh, const struct v4l2_event_subscription *s)
@@ -1535,6 +1675,7 @@ static int vdec_open(struct file *file)
 	f.fmt.pix_mp.height = 1088;
 	try_format(file, NULL, &f);
 	c->src_fmt = f.fmt.pix_mp;
+	c->codec_id = vdec_codec_by_fourcc(c->src_fmt.pixelformat)->codec_id;
 	f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	try_format(file, NULL, &f);
 	c->dst_fmt = f.fmt.pix_mp;
@@ -1740,4 +1881,4 @@ static void __exit vdec_exit(void)
 module_init(vdec_init);
 module_exit(vdec_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("MediaTek MT6895 VCP stateful H.264 V4L2 decoder");
+MODULE_DESCRIPTION("MediaTek MT6895 VCP stateful V4L2 decoder");

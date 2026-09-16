@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* MT6895 stateful H.264 firmware protocol. */
+/* MT6895 firmware protocol for the stateful decoder frontend. */
 #include <linux/atomic.h>
 #include <linux/completion.h>
 #include <linux/dma-mapping.h>
@@ -39,7 +39,7 @@ struct mtk_vcp_vdec {
 	struct completion reply;
 	struct vcp_vdec_vsi *vsi;
 	u64 cookie, next_memory;
-	u32 address, expected;
+	u32 address, expected, codec_id;
 	int error;
 	bool initialized, broken, firmware_live;
 	unsigned long cores;
@@ -290,7 +290,8 @@ static void dec_receive(void *priv, const void *data, size_t size)
 	switch (id) {
 	case VCP_VDEC_CHECK_CODEC_ID:
 		reply_id = VCP_VDEC_CHECK_ID_DONE;
-		ret = le32_to_cpu(a->codec_id) == VCP_VDEC_H264 && !a->status ? 0 : -EINVAL;
+		ret = le32_to_cpu(a->codec_id) == READ_ONCE(d->codec_id) &&
+		      !a->status ? 0 : -EINVAL;
 		break;
 	case VCP_VDEC_MEM_ALLOC:
 	case VCP_VDEC_MEM_FREE:
@@ -485,6 +486,21 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mtk_vcp_vdec_init);
+
+/* VCP_VDEC_CHECK_CODEC_ID asks the AP to confirm the codec of the session.
+ * The frontend knows the negotiated format and hands the id down before the
+ * session starts.
+ */
+int mtk_vcp_vdec_set_codec(struct mtk_vcp_vdec *d, u32 codec_id)
+{
+	if (codec_id == VCP_VDEC_UNKNOWN || codec_id > VCP_VDEC_AV1)
+		return -EINVAL;
+	mutex_lock(&d->api_lock);
+	WRITE_ONCE(d->codec_id, codec_id);
+	mutex_unlock(&d->api_lock);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mtk_vcp_vdec_set_codec);
 
 /* Ask the firmware to publish one of its capability tables. The firmware
  * leaves the data in its own memory and reports the address back, so the AP
@@ -801,4 +817,4 @@ int mtk_vcp_vdec_destroy(struct mtk_vcp_vdec *d, bool after_reset)
 EXPORT_SYMBOL_GPL(mtk_vcp_vdec_destroy);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("MediaTek MT6895 VCP H.264 decoder protocol");
+MODULE_DESCRIPTION("MediaTek MT6895 VCP decoder protocol");

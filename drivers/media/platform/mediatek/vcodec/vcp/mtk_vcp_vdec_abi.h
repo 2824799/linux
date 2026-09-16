@@ -111,8 +111,28 @@ struct vcp_vdec_mem_op {
 #define VCP_VDEC_BUFFERS 64
 #define VCP_VDEC_PLANES 8
 #define VCP_VDEC_CAPS 128
-#define VCP_VDEC_H264 1
 #define VCP_VDEC_CHECK_ID_DONE 0xd008
+
+/* Codec ids carried in the VCP_VDEC_CHECK_CODEC_ID handshake. They are the
+ * vendor enum mtk_codec_type, shared with the encoder ABI, and have nothing
+ * to do with the V4L2 fourcc. During INIT the firmware probes the codecs it
+ * knows, one at a time, until the AP confirms the one the session uses.
+ */
+enum vcp_vdec_codec {
+	VCP_VDEC_UNKNOWN = 0,
+	VCP_VDEC_H264,
+	VCP_VDEC_H265,
+	VCP_VDEC_HEIF,
+	VCP_VDEC_VP8,
+	VCP_VDEC_VP9,
+	VCP_VDEC_MPEG4,
+	VCP_VDEC_H263,
+	VCP_VDEC_MPEG12,
+	VCP_VDEC_WMV,
+	VCP_VDEC_RV30,
+	VCP_VDEC_RV40,
+	VCP_VDEC_AV1,
+};
 
 struct vcp_vdec_query_ack {
 	__le32 id, ctx, status;
