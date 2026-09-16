@@ -260,6 +260,8 @@ static int mtk_vcodec_enc_get_chip_name(struct mtk_vcodec_enc_ctx *ctx)
 		return 8195;
 	else if (of_device_is_compatible(dev->of_node, "mediatek,mt8188-vcodec-enc"))
 		return 8188;
+	else if (of_device_is_compatible(dev->of_node, "mediatek,mt6895-vcodec-enc"))
+		return 6895;
 	else
 		return 8173;
 }
