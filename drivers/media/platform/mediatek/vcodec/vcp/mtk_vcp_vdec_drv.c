@@ -20,6 +20,7 @@
 #include "mtk_vcp_vdec_hw.h"
 
 #define DEC_SURFACES 36
+#define DEC_TIMESTAMPS 64
 struct vdec_ctx;
 struct vdec_dev {
 	struct device *dev, *bs_dev, *ube_dev;
@@ -61,6 +62,9 @@ struct vdec_ctx {
 	bool submitted;   /* head OUTPUT buffer handed to firmware, release pending */
 	bool last_pending; /* previous capture sequence still needs its LAST marker */
 	bool wait_capture; /* new sequence waits for the client to restart CAPTURE */
+	u64 src_ts[DEC_TIMESTAMPS];      /* OUTPUT timestamps, submission order */
+	u32 ts_read, ts_count;
+	u32 prev_dst_size[2], prev_dst_planes; /* CAPTURE geometry before the change */
 };
 
 static struct vdec_ctx *file_ctx(struct file *file)
@@ -264,6 +268,8 @@ static int session_teardown(struct vdec_ctx *c)
 	c->pool_count = 0;
 	c->pending_count = 0;
 	c->pending_read = 0;
+	c->ts_count = 0;
+	c->ts_read = 0;
 	VCPDBG("teardown: complete\n");
 	return 0;
 retain:
@@ -284,6 +290,44 @@ static int session_stop(struct vdec_ctx *c)
 		return ret;
 	cmpxchg(&c->dev->ctx, c, NULL);
 	return 0;
+}
+
+static void push_source_timestamp(struct vdec_ctx *c, u64 timestamp)
+{
+	/* Firmware is ahead of the submissions: drop the oldest entry rather
+	 * than letting the ring grow without bound.
+	 */
+	if (c->ts_count == DEC_TIMESTAMPS) {
+		c->ts_read = (c->ts_read + 1) % DEC_TIMESTAMPS;
+		c->ts_count--;
+	}
+	c->src_ts[(c->ts_read + c->ts_count++) % DEC_TIMESTAMPS] = timestamp;
+	VCPDBG("ts: pushed %llu count=%u\n", timestamp, c->ts_count);
+}
+
+static u64 pop_source_timestamp(struct vdec_ctx *c)
+{
+	u64 timestamp;
+
+	if (!c->ts_count)
+		return 0;
+	timestamp = c->src_ts[c->ts_read];
+	c->ts_read = (c->ts_read + 1) % DEC_TIMESTAMPS;
+	c->ts_count--;
+	return timestamp;
+}
+
+/* A decoder has to copy the OUTPUT timestamp onto the buffer it hands back,
+ * which is what V4L2_BUF_FLAG_TIMESTAMP_COPY promises the client. The
+ * firmware is handed that timestamp with every access unit and echoes it in
+ * its frame ring, but only while it returns the pictures in decode order: as
+ * soon as it reorders for display (B pictures) the echoed field stops
+ * describing the picture it is attached to, and has been seen carrying a
+ * plain ktime. The driver keeps its own copy instead.
+ */
+static u64 frame_timestamp(struct vdec_ctx *c)
+{
+	return pop_source_timestamp(c);
 }
 
 static int collect_events(struct vdec_ctx *c)
@@ -319,11 +363,13 @@ static int collect_events(struct vdec_ctx *c)
 			       c->pending_count, i);
 			return -EOVERFLOW;
 		}
+		u64 timestamp = frame_timestamp(c);
+
 		c->surfaces[i].pending = true;
 		c->pending[(c->pending_read + c->pending_count++) % DEC_SURFACES] =
-			(struct vdec_pending){ .surface = i, .timestamp = event.timestamp };
+			(struct vdec_pending){ .surface = i, .timestamp = timestamp };
 		VCPDBG("event: display surface=%u pending=%u ts=%llu\n", i,
-		       c->pending_count, event.timestamp);
+		       c->pending_count, timestamp);
 	}
 	if (ret != -EAGAIN)
 		VCPDBG("events: stopped with %d\n", ret);
@@ -582,6 +628,13 @@ static int res_change_restart(struct vdec_ctx *c, struct vb2_v4l2_buffer *src)
 	/* Queries issued after the SOURCE_CHANGE event must describe the stream
 	 * that follows it, so the new sequence is parsed before it is published.
 	 */
+	/* Remember what the capture queue is still sized for: the client may
+	 * have to re-queue a buffer it allocated for that geometry before the
+	 * deferred LAST marker of the old sequence can be handed out.
+	 */
+	c->prev_dst_planes = c->dst_fmt.num_planes;
+	c->prev_dst_size[0] = c->dst_fmt.plane_fmt[0].sizeimage;
+	c->prev_dst_size[1] = c->dst_fmt.plane_fmt[1].sizeimage;
 	if (src) {
 		ret = parse_headers(c, src);
 		if (ret && ret != -EAGAIN) {
@@ -837,6 +890,10 @@ static void decode_work(struct work_struct *work)
 				}
 				goto finish;
 			}
+			/* The access unit is decoded from here on, so this is the
+			 * timestamp the picture it produces carries.
+			 */
+			push_source_timestamp(c, src->vb2_buf.timestamp);
 		}
 		deadline = jiffies + msecs_to_jiffies(5000);
 		while (!c->source_done) {
@@ -1006,11 +1063,23 @@ static int buffer_prepare(struct vb2_buffer *vb)
 	unsigned int i;
 
 	for (i = 0; i < f->num_planes; i++) {
-		if (vb2_plane_size(vb, i) < f->plane_fmt[i].sizeimage) {
+		u32 need = f->plane_fmt[i].sizeimage;
+
+		/* The capture queue still holds buffers allocated for the previous
+		 * geometry: the client has to be able to hand them back to receive
+		 * the LAST marker of that sequence, and the new geometry only starts
+		 * once it restarts the queue. Nothing is written into a buffer that
+		 * does not fit, deliver_frames() rejects those instead.
+		 */
+		if (!is_output(vb->type) &&
+		    (READ_ONCE(c->last_pending) || READ_ONCE(c->wait_capture)) &&
+		    i < c->prev_dst_planes && c->prev_dst_size[i] < need)
+			need = c->prev_dst_size[i];
+		if (vb2_plane_size(vb, i) < need) {
 			VCPDBG("prepare: %s buf %u plane %u too small: have=%lu need=%u, geometry %ux%u\n",
 			       is_output(vb->type) ? "output" : "capture",
-			       vb->index, i, vb2_plane_size(vb, i),
-			       f->plane_fmt[i].sizeimage, f->width, f->height);
+			       vb->index, i, vb2_plane_size(vb, i), need,
+			       f->width, f->height);
 			return -EINVAL;
 		}
 	}
@@ -1030,8 +1099,9 @@ static void buffer_queue(struct vb2_buffer *vb)
 	struct vdec_ctx *c = vb2_get_drv_priv(vb->vb2_queue);
 
 	v4l2_m2m_buf_queue(c->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
-	VCPDBG("queue: %s buf %u queued (srcq=%u dstq=%u)\n",
+	VCPDBG("queue: %s buf %u queued ts=%llu (srcq=%u dstq=%u)\n",
 	       is_output(vb->type) ? "output" : "capture", vb->index,
+	       vb->timestamp,
 	       v4l2_m2m_num_src_bufs_ready(c->fh.m2m_ctx),
 	       v4l2_m2m_num_dst_bufs_ready(c->fh.m2m_ctx));
 }
@@ -1132,6 +1202,14 @@ static void stop_streaming(struct vb2_queue *q)
 		}
 		VCPDBG("stop_streaming: capture, dropped=%u lastp=%d waitcap=%d\n",
 		       dropped, c->last_pending, c->wait_capture);
+		/* Restarting CAPTURE abandons the old capture sequence, so its
+		 * deferred LAST marker must not be handed out on the first
+		 * buffer of the new one.
+		 */
+		if (READ_ONCE(c->last_pending)) {
+			WRITE_ONCE(c->last_pending, false);
+			VCPDBG("stop_streaming: capture, dropping the deferred LAST marker\n");
+		}
 		return;
 	}
 	session_stop(c);
