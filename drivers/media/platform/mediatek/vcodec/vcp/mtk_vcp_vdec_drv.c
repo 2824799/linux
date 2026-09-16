@@ -21,6 +21,11 @@
 
 #define DEC_SURFACES 36
 #define DEC_TIMESTAMPS 64
+
+static bool vdec_caps_dump;
+module_param_named(caps_dump, vdec_caps_dump, bool, 0644);
+MODULE_PARM_DESC(caps_dump, "dump the firmware decoder capability tables on session boot");
+
 struct vdec_ctx;
 struct vdec_dev {
 	struct device *dev, *bs_dev, *ube_dev;
@@ -149,6 +154,51 @@ static const struct mtk_vcp_vdec_ops codec_ops = {
 
 static int session_teardown(struct vdec_ctx *c);
 
+/* One-shot bring-up probe: ask the firmware which formats and frame sizes
+ * the decoder accepts, so the driver's static tables can be checked against
+ * the firmware instead of against the vendor header.
+ */
+static void vdec_dump_caps(struct vdec_ctx *c)
+{
+	struct vcp_vdec_cap_format *fmts;
+	struct vcp_vdec_cap_framesize *sizes;
+	int ret, i;
+
+	fmts = kzalloc(sizeof(*fmts) * VCP_VDEC_CAPS, GFP_KERNEL);
+	sizes = kzalloc(sizeof(*sizes) * VCP_VDEC_CAPS, GFP_KERNEL);
+	if (!fmts || !sizes)
+		goto out;
+	ret = mtk_vcp_vdec_query_cap(c->decoder, VCP_VDEC_CAP_SUPPORTED_FORMATS,
+				     fmts, sizeof(*fmts) * VCP_VDEC_CAPS);
+	if (ret) {
+		dev_warn(c->dev->dev, "VDEC caps query failed: %d\n", ret);
+		goto out;
+	}
+	for (i = 0; i < VCP_VDEC_CAPS && le32_to_cpu(fmts[i].fourcc); i++)
+		dev_info(c->dev->dev,
+			 "VDEC cap fmt[%d]: fourcc=%#x type=%u planes=%u\n", i,
+			 le32_to_cpu(fmts[i].fourcc), le32_to_cpu(fmts[i].type),
+			 le32_to_cpu(fmts[i].num_planes));
+	ret = mtk_vcp_vdec_query_cap(c->decoder, VCP_VDEC_CAP_FRAME_SIZES, sizes,
+				     sizeof(*sizes) * VCP_VDEC_CAPS);
+	if (ret) {
+		dev_warn(c->dev->dev, "VDEC frame sizes query failed: %d\n", ret);
+		goto out;
+	}
+	for (i = 0; i < VCP_VDEC_CAPS && le32_to_cpu(sizes[i].fourcc); i++)
+		dev_info(c->dev->dev,
+			 "VDEC cap size[%d]: fourcc=%#x profile=%u level=%u %ux%u..%ux%u\n",
+			 i, le32_to_cpu(sizes[i].fourcc),
+			 le32_to_cpu(sizes[i].profile), le32_to_cpu(sizes[i].level),
+			 le32_to_cpu(sizes[i].stepwise.min_width),
+			 le32_to_cpu(sizes[i].stepwise.min_height),
+			 le32_to_cpu(sizes[i].stepwise.max_width),
+			 le32_to_cpu(sizes[i].stepwise.max_height));
+out:
+	kfree(fmts);
+	kfree(sizes);
+}
+
 static int session_boot(struct vdec_ctx *c)
 {
 	int ret;
@@ -184,6 +234,8 @@ static int session_boot(struct vdec_ctx *c)
 		return ret;
 	}
 	c->initialized = true;
+	if (vdec_caps_dump)
+		vdec_dump_caps(c);
 	c->bs.size = c->src_fmt.plane_fmt[0].sizeimage;
 	c->bs.cpu = dma_alloc_coherent(c->dev->bs_dev, c->bs.size, &c->bs.dma, GFP_KERNEL);
 	VCPDBG("boot: bitstream mapping size=%zu cpu=%px dma=%pad\n",

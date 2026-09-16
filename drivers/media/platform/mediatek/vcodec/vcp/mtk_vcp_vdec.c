@@ -267,7 +267,12 @@ static void dec_receive(void *priv, const void *data, size_t size)
 	       (s32)le32_to_cpu(a->status));
 	mutex_lock(&d->rx_lock);
 	if (id == d->expected) {
-		if (size != sizeof(*a)) {
+		/* Plain acks are a fixed size, but some commands answer with a
+		 * larger structure (the capability query returns its own layout).
+		 * Keep whatever the receive buffer can hold and let the caller
+		 * validate the size it expects.
+		 */
+		if (size < sizeof(*a)) {
 			dec_fail(d, -EPROTO);
 			goto out;
 		}
@@ -480,6 +485,53 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mtk_vcp_vdec_init);
+
+/* Ask the firmware to publish one of its capability tables. The firmware
+ * leaves the data in its own memory and reports the address back, so the AP
+ * copies it out; nothing is queued on the data address in the request.
+ */
+int mtk_vcp_vdec_query_cap(struct mtk_vcp_vdec *d, u32 id, void *out, size_t size)
+{
+	struct vcp_vdec_query_cap msg = {
+		.msg_id = cpu_to_le32(VCP_VDEC_AP_QUERY_CAP),
+		.ctx_id = cpu_to_le32(lower_32_bits(d->cookie)),
+		.id = cpu_to_le32(id),
+		.ap_inst_addr = cpu_to_le64(d->cookie),
+	};
+	struct vcp_vdec_query_ack *ack = (void *)d->response;
+	void *shared;
+	int ret;
+
+	if (!out || !size)
+		return -EINVAL;
+	mutex_lock(&d->api_lock);
+	if (!d->initialized || d->broken) {
+		ret = -EIO;
+		goto out;
+	}
+	ret = dec_command(d, &msg, sizeof(msg), VCP_VDEC_QUERY_CAP_DONE);
+	if (ret)
+		goto out;
+	if (d->response_size != sizeof(*ack)) {
+		dev_info(d->dev,
+			 "VDEC query %u: reply size %zu, want %zu, head=%*phN\n", id,
+			 d->response_size, sizeof(*ack),
+			 (int)min_t(size_t, d->response_size, 24), d->response);
+		ret = -EPROTO;
+		goto out;
+	}
+	shared = dec_shared(d, get_unaligned_le32(d->response + 40), size);
+	if (IS_ERR(shared)) {
+		ret = PTR_ERR(shared);
+		goto out;
+	}
+	dma_rmb();
+	memcpy(out, shared, size);
+out:
+	mutex_unlock(&d->api_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mtk_vcp_vdec_query_cap);
 
 int mtk_vcp_vdec_picture(struct mtk_vcp_vdec *d, struct vcp_vdec_picture *p)
 {

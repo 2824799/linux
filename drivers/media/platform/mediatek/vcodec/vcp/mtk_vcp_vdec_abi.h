@@ -65,6 +65,28 @@ struct vcp_vdec_query_cap {
 	__le64 ap_inst_addr, ap_data_addr;
 };
 
+/* The query id field of VCP_VDEC_AP_QUERY_CAP. The reply is an array of
+ * VCP_VDEC_CAPS entries of the matching structure, written by the firmware
+ * and copied out by the AP.
+ */
+enum vcp_vdec_cap_id {
+	VCP_VDEC_CAP_SUPPORTED_FORMATS = 8,
+	VCP_VDEC_CAP_FRAME_SIZES = 9,
+};
+
+struct vcp_vdec_cap_format {
+	__le32 fourcc;
+	__le32 type;
+	__le32 num_planes;
+};
+
+struct vcp_vdec_cap_framesize {
+	__le32 fourcc;
+	__le32 profile;
+	__le32 level;
+	struct v4l2_frmsize_stepwise stepwise;
+};
+
 struct vcp_vdec_ack {
 	__le32 msg_id, ctx_id, status;
 	__le64 ap_inst_addr;
