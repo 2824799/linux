@@ -273,6 +273,7 @@ static int vcp_h264_set_param(void *handle, enum venc_set_param_type type,
 	case VENC_YUV_FORMAT_YV12:
 	case VENC_YUV_FORMAT_NV12:
 	case VENC_YUV_FORMAT_NV21:
+	case VENC_YUV_FORMAT_P010:
 		break;
 	default:
 		return -EINVAL;

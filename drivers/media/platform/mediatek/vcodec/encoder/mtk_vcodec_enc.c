@@ -19,6 +19,11 @@
 #define MTK_VENC_HD_MAX_H	1088U
 #define MTK_VENC_4K_MAX_W	3840U
 #define MTK_VENC_4K_MAX_H	2176U
+/* The VCP encoder firmware publishes its own limits through VCP_ENC_QUERY;
+ * on MT6895 it accepts H.264 up to 7680x4320, well past the VPU tables.
+ */
+#define MTK_VENC_VCP_MAX_W	7680U
+#define MTK_VENC_VCP_MAX_H	4320U
 
 #define DFT_CFG_WIDTH	MTK_VENC_MIN_W
 #define DFT_CFG_HEIGHT	MTK_VENC_MIN_H
@@ -39,6 +44,31 @@ static const struct v4l2_frmsize_stepwise mtk_venc_4k_framesizes = {
 	MTK_VENC_MIN_W, MTK_VENC_4K_MAX_W, 16,
 	MTK_VENC_MIN_H, MTK_VENC_4K_MAX_H, 16,
 };
+
+static const struct v4l2_frmsize_stepwise mtk_venc_vcp_framesizes = {
+	MTK_VENC_MIN_W, MTK_VENC_VCP_MAX_W, 16,
+	MTK_VENC_MIN_H, MTK_VENC_VCP_MAX_H, 16,
+};
+
+/*
+ * The largest frame the encoder may be asked for. The VCP firmware reports
+ * its own limits, so a VCP encoder does not depend on the capability bit the
+ * legacy firmware loader fills in; the VPU platforms still do.
+ */
+static void mtk_venc_max_size(struct mtk_vcodec_enc_ctx *ctx,
+			      unsigned int *max_w, unsigned int *max_h)
+{
+	if (ctx->dev->venc_pdata->uses_vcp) {
+		*max_w = MTK_VENC_VCP_MAX_W;
+		*max_h = MTK_VENC_VCP_MAX_H;
+	} else if (ctx->dev->enc_capability & MTK_VENC_4K_CAPABILITY_ENABLE) {
+		*max_w = MTK_VENC_4K_MAX_W;
+		*max_h = MTK_VENC_4K_MAX_H;
+	} else {
+		*max_w = MTK_VENC_HD_MAX_W;
+		*max_h = MTK_VENC_HD_MAX_H;
+	}
+}
 
 static int vidioc_venc_s_ctrl(struct v4l2_ctrl *ctrl)
 {
@@ -186,7 +216,9 @@ static int vidioc_enum_framesizes(struct file *file, void *fh,
 
 	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 
-	if (ctx->dev->enc_capability & MTK_VENC_4K_CAPABILITY_ENABLE)
+	if (ctx->dev->venc_pdata->uses_vcp)
+		fsize->stepwise = mtk_venc_vcp_framesizes;
+	else if (ctx->dev->enc_capability & MTK_VENC_4K_CAPABILITY_ENABLE)
 		fsize->stepwise = mtk_venc_4k_framesizes;
 	else
 		fsize->stepwise = mtk_venc_hd_framesizes;
@@ -315,16 +347,11 @@ static int vidioc_try_fmt_out(struct mtk_vcodec_enc_ctx *ctx, struct v4l2_format
 	struct v4l2_pix_format_mplane *pix_fmt_mp = &f->fmt.pix_mp;
 	int tmp_w, tmp_h;
 	unsigned int max_width, max_height;
+	unsigned int luma, bps, pad0, pad_c2, pad_c3;
 
 	pix_fmt_mp->field = V4L2_FIELD_NONE;
 
-	if (ctx->dev->enc_capability & MTK_VENC_4K_CAPABILITY_ENABLE) {
-		max_width = MTK_VENC_4K_MAX_W;
-		max_height = MTK_VENC_4K_MAX_H;
-	} else {
-		max_width = MTK_VENC_HD_MAX_W;
-		max_height = MTK_VENC_HD_MAX_H;
-	}
+	mtk_venc_max_size(ctx, &max_width, &max_height);
 
 	pix_fmt_mp->height = clamp(pix_fmt_mp->height, MTK_VENC_MIN_H, max_height);
 	pix_fmt_mp->width = clamp(pix_fmt_mp->width, MTK_VENC_MIN_W, max_width);
@@ -354,27 +381,39 @@ static int vidioc_try_fmt_out(struct mtk_vcodec_enc_ctx *ctx, struct v4l2_format
 			  pix_fmt_mp->plane_fmt[1].sizeimage);
 
 	pix_fmt_mp->num_planes = fmt->num_planes;
+	/* P010 samples are two bytes wide; every other accepted input is 8-bit
+	 * 4:2:0, either split across planes or packed into a single buffer.
+	 */
+	bps = fmt->fourcc == V4L2_PIX_FMT_P010 ? 2 : 1;
+	luma = pix_fmt_mp->width * pix_fmt_mp->height;
+	pad0 = (ALIGN(pix_fmt_mp->width, 16) * 2) * 16 * bps;
+	pad_c2 = ALIGN(pix_fmt_mp->width, 16) * 16 * bps;
+	pad_c3 = (ALIGN(pix_fmt_mp->width, 16) / 2) * 16 * bps;
 	pix_fmt_mp->plane_fmt[0].sizeimage =
-			pix_fmt_mp->width * pix_fmt_mp->height +
-			((ALIGN(pix_fmt_mp->width, 16) * 2) * 16);
-	pix_fmt_mp->plane_fmt[0].bytesperline = pix_fmt_mp->width;
+			luma * bps + pad0;
+	pix_fmt_mp->plane_fmt[0].bytesperline = pix_fmt_mp->width * bps;
 
-	if (pix_fmt_mp->num_planes == 2) {
+	if (pix_fmt_mp->num_planes == 1) {
+		/* Luma and chroma share one buffer. */
+		pix_fmt_mp->plane_fmt[0].sizeimage += (luma / 2) * bps + pad_c2;
+		pix_fmt_mp->plane_fmt[1].sizeimage = 0;
+		pix_fmt_mp->plane_fmt[2].sizeimage = 0;
+		pix_fmt_mp->plane_fmt[1].bytesperline = 0;
+		pix_fmt_mp->plane_fmt[2].bytesperline = 0;
+	} else if (pix_fmt_mp->num_planes == 2) {
 		pix_fmt_mp->plane_fmt[1].sizeimage =
-			(pix_fmt_mp->width * pix_fmt_mp->height) / 2 +
-			(ALIGN(pix_fmt_mp->width, 16) * 16);
+			(luma / 2) * bps + pad_c2;
 		pix_fmt_mp->plane_fmt[2].sizeimage = 0;
 		pix_fmt_mp->plane_fmt[1].bytesperline =
-						pix_fmt_mp->width;
+			pix_fmt_mp->width * bps;
 		pix_fmt_mp->plane_fmt[2].bytesperline = 0;
 	} else if (pix_fmt_mp->num_planes == 3) {
 		pix_fmt_mp->plane_fmt[1].sizeimage =
-		pix_fmt_mp->plane_fmt[2].sizeimage =
-			(pix_fmt_mp->width * pix_fmt_mp->height) / 4 +
-			((ALIGN(pix_fmt_mp->width, 16) / 2) * 16);
+			pix_fmt_mp->plane_fmt[2].sizeimage =
+			(luma / 4) * bps + pad_c3;
 		pix_fmt_mp->plane_fmt[1].bytesperline =
 			pix_fmt_mp->plane_fmt[2].bytesperline =
-			pix_fmt_mp->width / 2;
+			(pix_fmt_mp->width / 2) * bps;
 	}
 
 	pix_fmt_mp->flags = 0;
@@ -389,17 +428,24 @@ static void mtk_venc_set_param(struct mtk_vcodec_enc_ctx *ctx,
 	struct mtk_enc_params *enc_params = &ctx->enc_params;
 
 	switch (q_data_src->fmt->fourcc) {
+	case V4L2_PIX_FMT_YUV420:
 	case V4L2_PIX_FMT_YUV420M:
 		param->input_yuv_fmt = VENC_YUV_FORMAT_I420;
 		break;
+	case V4L2_PIX_FMT_YVU420:
 	case V4L2_PIX_FMT_YVU420M:
 		param->input_yuv_fmt = VENC_YUV_FORMAT_YV12;
 		break;
+	case V4L2_PIX_FMT_NV12:
 	case V4L2_PIX_FMT_NV12M:
 		param->input_yuv_fmt = VENC_YUV_FORMAT_NV12;
 		break;
+	case V4L2_PIX_FMT_NV21:
 	case V4L2_PIX_FMT_NV21M:
 		param->input_yuv_fmt = VENC_YUV_FORMAT_NV21;
+		break;
+	case V4L2_PIX_FMT_P010:
+		param->input_yuv_fmt = VENC_YUV_FORMAT_P010;
 		break;
 	default:
 		mtk_v4l2_venc_err(ctx, "Unsupported fourcc =%d", q_data_src->fmt->fourcc);

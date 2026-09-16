@@ -119,6 +119,31 @@ static const struct mtk_video_fmt mtk_video_formats_output[] = {
 		.type = MTK_FMT_FRAME,
 		.num_planes = 3,
 	},
+	{
+		.fourcc = V4L2_PIX_FMT_NV12,
+		.type = MTK_FMT_FRAME,
+		.num_planes = 1,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_NV21,
+		.type = MTK_FMT_FRAME,
+		.num_planes = 1,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_YUV420,
+		.type = MTK_FMT_FRAME,
+		.num_planes = 1,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_YVU420,
+		.type = MTK_FMT_FRAME,
+		.num_planes = 1,
+	},
+	{
+		.fourcc = V4L2_PIX_FMT_P010,
+		.type = MTK_FMT_FRAME,
+		.num_planes = 2,
+	},
 };
 
 static const struct mtk_video_fmt mtk_video_formats_capture_h264[] =  {
