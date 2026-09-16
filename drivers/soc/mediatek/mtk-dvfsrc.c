@@ -101,7 +101,12 @@ struct dvfsrc_soc_data {
 	const u8 *bw_units;
 	const bool has_emi_ddr;
 	const struct dvfsrc_opp_desc *opps_desc;
-	/** @num_opp_desc - entries in @opps_desc, or 0 when not described */
+	/**
+	 * @num_opp_desc - entries in @opps_desc.  Must be set whenever
+	 * @opps_desc is, because the size cannot be recovered from the
+	 * pointer stored here; platforms whose firmware publishes its own
+	 * gear tables leave both unset and set @get_hw_opps instead.
+	 */
 	u32 num_opp_desc;
 	u32 (*calc_dram_bw)(struct mtk_dvfsrc *dvfsrc, enum mtk_dvfsrc_bw_type type, u64 bw);
 	u32 (*get_target_level)(struct mtk_dvfsrc *dvfsrc);
@@ -751,6 +756,21 @@ static int mtk_dvfsrc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	dvfsrc->dvd = of_device_get_match_data(&pdev->dev);
+	if (!dvfsrc->dvd)
+		return dev_err_probe(&pdev->dev, -ENODEV, "missing platform data\n");
+
+	/*
+	 * A platform either has firmware-published gear tables or describes
+	 * its operating points in software.  Check that here, so that a new
+	 * SoC cannot come up with no table at all or - the failure mode this
+	 * replaces - with a pointer but a zero count, which would send every
+	 * DRAM type, valid ones included, to the first table.
+	 */
+	if (!dvfsrc->dvd->get_hw_opps &&
+	    (!dvfsrc->dvd->opps_desc || !dvfsrc->dvd->num_opp_desc))
+		return dev_err_probe(&pdev->dev, -EINVAL,
+				     "no DVFSRC operating points described\n");
+
 	dvfsrc->dev = &pdev->dev;
 	spin_lock_init(&dvfsrc->req_lock);
 
@@ -782,8 +802,8 @@ static int mtk_dvfsrc_probe(struct platform_device *pdev)
 
 		if (dram_type >= dvfsrc->dvd->num_opp_desc) {
 			dev_warn(&pdev->dev,
-				 "unknown DRAM type %d, using the first OPP table\n",
-				 dram_type);
+				 "unknown DRAM type %d (%u tables), using the first OPP table\n",
+				dram_type, dvfsrc->dvd->num_opp_desc);
 			dram_type = 0;
 		}
 
@@ -847,6 +867,17 @@ static const u32 dvfsrc_bw_max_constr_v2[DVFSRC_BW_MAX] = {
 	[DVFSRC_BW_HRT] = 1023,
 };
 
+/*
+ * Publish a software operating point table together with its size.  The
+ * two always go together: the bound check in mtk_dvfsrc_probe() indexes
+ * @opps_desc with the DRAM type reported by the firmware, so a platform
+ * that describes its tables without saying how many there are would have
+ * every request, including the valid ones, fall back to the first table.
+ */
+#define DVFSRC_SW_OPPS(_name)		\
+	.opps_desc = _name,		\
+	.num_opp_desc = ARRAY_SIZE(_name)
+
 static const struct dvfsrc_opp dvfsrc_opp_mt6893_lp4[] = {
 	{ 0, 0 }, { 1, 0 }, { 2, 0 }, { 3, 0 },
 	{ 0, 1 }, { 1, 1 }, { 2, 1 }, { 3, 1 },
@@ -864,7 +895,7 @@ static const struct dvfsrc_opp_desc dvfsrc_opp_mt6893_desc[] = {
 };
 
 static const struct dvfsrc_soc_data mt6893_data = {
-	.opps_desc = dvfsrc_opp_mt6893_desc,
+	DVFSRC_SW_OPPS(dvfsrc_opp_mt6893_desc),
 	.regs = dvfsrc_mt8195_regs,
 	.get_target_level = dvfsrc_get_target_level_v2,
 	.get_current_level = dvfsrc_get_current_level_v2,
@@ -905,7 +936,7 @@ static const struct dvfsrc_opp_desc dvfsrc_opp_mt8183_desc[] = {
 };
 
 static const struct dvfsrc_soc_data mt8183_data = {
-	.opps_desc = dvfsrc_opp_mt8183_desc,
+	DVFSRC_SW_OPPS(dvfsrc_opp_mt8183_desc),
 	.regs = dvfsrc_mt8183_regs,
 	.calc_dram_bw = dvfsrc_calc_dram_bw_v1,
 	.get_target_level = dvfsrc_get_target_level_v1,
@@ -937,7 +968,7 @@ static const struct dvfsrc_opp_desc dvfsrc_opp_mt8195_desc[] = {
 };
 
 static const struct dvfsrc_soc_data mt8195_data = {
-	.opps_desc = dvfsrc_opp_mt8195_desc,
+	DVFSRC_SW_OPPS(dvfsrc_opp_mt8195_desc),
 	.regs = dvfsrc_mt8195_regs,
 	.calc_dram_bw = dvfsrc_calc_dram_bw_v1,
 	.get_target_level = dvfsrc_get_target_level_v2,
@@ -1009,8 +1040,7 @@ static const struct dvfsrc_opp_desc dvfsrc_opp_mt6895_desc[] = {
 };
 
 static const struct dvfsrc_soc_data mt6895_data = {
-	.opps_desc = dvfsrc_opp_mt6895_desc,
-	.num_opp_desc = ARRAY_SIZE(dvfsrc_opp_mt6895_desc),
+	DVFSRC_SW_OPPS(dvfsrc_opp_mt6895_desc),
 	.regs = dvfsrc_mt6895_regs,
 	.get_target_level = dvfsrc_get_target_level_v4,
 	.get_current_level = dvfsrc_get_current_level_mt6895,
