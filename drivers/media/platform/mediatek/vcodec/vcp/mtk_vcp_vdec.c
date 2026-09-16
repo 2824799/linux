@@ -55,8 +55,14 @@ struct mtk_vcp_vdec {
 
 static atomic64_t session_cookie = ATOMIC64_INIT(0);
 
+/* DEBUG: temporary protocol tracing, remove before submission. */
+#define VCPDBG(fmt, ...) pr_info("VCPDBG:%s: " fmt, __func__, ##__VA_ARGS__)
+
 static void dec_fail(struct mtk_vcp_vdec *d, int error)
 {
+	VCPDBG("failure: %d (kept %d), initialized=%d firmware_live=%d cores=%#lx\n",
+	       error, error ?: -EIO, d->initialized, d->firmware_live,
+	       d->cores);
 	d->broken = true;
 	d->error = error ?: -EIO;
 	complete(&d->reply);
@@ -245,12 +251,20 @@ static void dec_receive(void *priv, const void *data, size_t size)
 	u32 id, reply_id;
 	int ret = 0;
 
-	if (size < sizeof(*a) || size > sizeof(buf))
+	VCPDBG("rx: %zu bytes\n", size);
+	if (size < sizeof(*a) || size > sizeof(buf)) {
+		VCPDBG("rx: unexpected size %zu (ack is %zu)\n", size, sizeof(*a));
 		return;
+	}
 	memcpy(buf, data, size);
-	if (le64_to_cpu(a->ap_inst_addr) != d->cookie)
+	if (le64_to_cpu(a->ap_inst_addr) != d->cookie) {
+		VCPDBG("rx: foreign context %#llx (mine %#llx)\n",
+		       (u64)le64_to_cpu(a->ap_inst_addr), d->cookie);
 		return;
+	}
 	id = le32_to_cpu(a->msg_id);
+	VCPDBG("rx: id=%#x expected=%#x status=%d\n", id, d->expected,
+	       (s32)le32_to_cpu(a->status));
 	mutex_lock(&d->rx_lock);
 	if (id == d->expected) {
 		if (size != sizeof(*a)) {
@@ -332,6 +346,8 @@ static void dec_receive(void *priv, const void *data, size_t size)
 	a->status = cpu_to_le32(ret);
 	dma_wmb();
 	ret = mtk_vcp_ipi_send(d->vcp, MTK_VCP_DECODER, buf, size);
+	VCPDBG("rx: replying id=%#x status=%d (send=%d)\n", reply_id,
+	       (s32)le32_to_cpu(a->status), ret);
 	if (ret)
 		dec_fail(d, ret);
 out:
@@ -341,12 +357,16 @@ out:
 /* api_lock held, rx_lock must remain available while waiting for replies. */
 static int dec_command(struct mtk_vcp_vdec *d, const void *msg, size_t size, u32 ack)
 {
+	unsigned long started = jiffies;
+	u32 id = get_unaligned_le32(msg);
 	int ret;
 
 	mutex_lock(&d->rx_lock);
 	if (d->broken) {
 		ret = d->error ?: -EIO;
 		mutex_unlock(&d->rx_lock);
+		VCPDBG("cmd: id=%#x ack=%#x refused, session broken (%d)\n", id,
+		       ack, ret);
 		return ret;
 	}
 	d->expected = ack;
@@ -358,6 +378,8 @@ static int dec_command(struct mtk_vcp_vdec *d, const void *msg, size_t size, u32
 	ret = get_unaligned_le32(msg) == VCP_VDEC_AP_FRAME_BUFFER ?
 		mtk_vcp_vdec_resource_send(d->vcp, msg, size) :
 		mtk_vcp_ipi_send(d->vcp, MTK_VCP_DECODER, msg, size);
+	VCPDBG("cmd: id=%#x ack=%#x size=%zu sent (ret=%d), waiting %u ms\n",
+	       id, ack, size, ret, DEC_RPC_TIMEOUT);
 	if (!ret && !wait_for_completion_timeout(&d->reply, msecs_to_jiffies(DEC_RPC_TIMEOUT)))
 		ret = -ETIMEDOUT;
 	mutex_lock(&d->rx_lock);
@@ -368,6 +390,8 @@ static int dec_command(struct mtk_vcp_vdec *d, const void *msg, size_t size, u32
 	d->expected = 0;
 	mutex_unlock(&d->rx_lock);
 	dma_rmb();
+	VCPDBG("cmd: id=%#x ack=%#x -> %d in %u ms\n", id, ack, ret,
+	       jiffies_to_msecs(jiffies - started));
 	return ret;
 }
 
@@ -640,6 +664,8 @@ int mtk_vcp_vdec_reset(struct mtk_vcp_vdec *d, bool drain)
 	if (!ret)
 		ret = dec_simple_command(d, VCP_VDEC_AP_RESET, VCP_VDEC_RESET_DONE, drain);
 out:
+	VCPDBG("reset: drain=%d initialized=%d -> %d\n", drain, d->initialized,
+	       ret);
 	mutex_unlock(&d->api_lock);
 	return ret;
 }
@@ -657,6 +683,7 @@ int mtk_vcp_vdec_event(struct mtk_vcp_vdec *d, struct vcp_vdec_event *e)
 		ret = 0;
 	} else if (d->broken) {
 		ret = d->error ?: -EIO;
+		VCPDBG("event: session broken, returning %d\n", ret);
 	}
 	mutex_unlock(&d->rx_lock);
 	return ret;
@@ -690,6 +717,7 @@ int mtk_vcp_vdec_deinit(struct mtk_vcp_vdec *d)
 		mutex_unlock(&d->rx_lock);
 	}
 out:
+	VCPDBG("deinit: initialized=%d -> %d\n", d->initialized, ret);
 	mutex_unlock(&d->api_lock);
 	return ret;
 }
@@ -702,8 +730,12 @@ int mtk_vcp_vdec_destroy(struct mtk_vcp_vdec *d, bool after_reset)
 	if (!d)
 		return 0;
 	if (after_reset ? !mtk_vcp_is_offline(d->vcp) :
-	    (d->firmware_live || d->broken || d->cores))
+	    (d->firmware_live || d->broken || d->cores)) {
+		VCPDBG("destroy: busy, after_reset=%d live=%d broken=%d cores=%#lx offline=%d\n",
+		       after_reset, d->firmware_live, d->broken, d->cores,
+		       mtk_vcp_is_offline(d->vcp));
 		return -EBUSY;
+	}
 	mtk_vcp_ipi_unregister(d->vcp, MTK_VCP_DECODER);
 	list_for_each_entry_safe(a, next, &d->allocations, list) {
 		d->ops->free(d->priv, a->type, &a->mem);
@@ -711,6 +743,7 @@ int mtk_vcp_vdec_destroy(struct mtk_vcp_vdec *d, bool after_reset)
 		kfree(a);
 	}
 	kfree(d);
+	VCPDBG("destroy: released\n");
 	return 0;
 }
 EXPORT_SYMBOL_GPL(mtk_vcp_vdec_destroy);

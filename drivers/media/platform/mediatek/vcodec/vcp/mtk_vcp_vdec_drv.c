@@ -67,6 +67,33 @@ static struct vdec_ctx *file_ctx(struct file *file)
 {
 	return container_of(file_to_v4l2_fh(file), struct vdec_ctx, fh);
 }
+
+/*
+ * DEBUG: temporary instrumentation for the decoder investigations (the two
+ * resolution-change hang paths and the session that reports no frames with
+ * the VCP left offline).  Everything from here down to the end of
+ * vdec_state() is debug-only, as are every VCPDBG() line and vdec_state()
+ * call in this file.  Remove all of it before the series is submitted.
+ */
+#define VCPDBG(fmt, ...) pr_info("VCPDBG:%s: " fmt, __func__, ##__VA_ARGS__)
+
+static void vdec_state(struct vdec_ctx *c, const char *tag)
+{
+	struct v4l2_m2m_ctx *m = c->fh.m2m_ctx;
+
+	if (!m) {
+		VCPDBG("state %s: no m2m context\n", tag);
+		return;
+	}
+	VCPDBG("state %s: hdr=%d boot=%d init=%d stop=%d fail=%d orph=%d done=%d drn=%d drnd=%d sub=%d lastp=%d waitcap=%d pool=%u pend=%u rd=%u seq=%u sseq=%u srcq=%u dstq=%u stopd=%d dst=%ux%u pic=%ux%u stride=%u/%u\n",
+	       tag, c->header, c->booted, c->initialized, c->stopping,
+	       c->failed, c->orphan, c->source_done, c->draining, c->drained,
+	       c->submitted, c->last_pending, c->wait_capture, c->pool_count,
+	       c->pending_count, c->pending_read, c->sequence, c->source_sequence,
+	       v4l2_m2m_num_src_bufs_ready(m), v4l2_m2m_num_dst_bufs_ready(m),
+	       v4l2_m2m_has_stopped(m), c->dst_fmt.width, c->dst_fmt.height,
+	       c->pic.width, c->pic.height, c->pic.stride, c->pic.buffer_height);
+}
 static bool is_output(enum v4l2_buf_type type)
 {
 	return type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
@@ -125,29 +152,42 @@ static int session_boot(struct vdec_ctx *c)
 	/* Device ownership is already held by the caller. */
 	if (c->decoder)
 		return 0;
+	VCPDBG("boot: creating session, vcp offline=%d\n",
+	       mtk_vcp_is_offline(c->dev->vcp));
 	c->decoder = mtk_vcp_vdec_create(c->dev->dev, c->dev->vcp, &codec_ops, c);
 	if (IS_ERR(c->decoder)) {
 		ret = PTR_ERR(c->decoder);
 		c->decoder = NULL;
 		cmpxchg(&c->dev->ctx, c, NULL);
+		VCPDBG("boot: decoder create failed: %d\n", ret);
 		return ret;
 	}
+	VCPDBG("boot: decoder created\n");
 	ret = mtk_vcp_boot(c->dev->vcp);
 	if (ret) {
 		dev_info(c->dev->dev, "session boot failed: %d\n", ret);
+		VCPDBG("boot: vcp boot failed: %d, offline=%d\n", ret,
+		       mtk_vcp_is_offline(c->dev->vcp));
 		return ret;
 	}
 	c->booted = true;
+	VCPDBG("boot: vcp running, offline=%d\n",
+	       mtk_vcp_is_offline(c->dev->vcp));
 	ret = mtk_vcp_vdec_init(c->decoder);
 	if (ret) {
 		dev_info(c->dev->dev, "session init failed: %d\n", ret);
+		VCPDBG("boot: vdec init failed: %d\n", ret);
 		return ret;
 	}
 	c->initialized = true;
 	c->bs.size = c->src_fmt.plane_fmt[0].sizeimage;
 	c->bs.cpu = dma_alloc_coherent(c->dev->bs_dev, c->bs.size, &c->bs.dma, GFP_KERNEL);
-	if (c->bs.cpu)
+	VCPDBG("boot: bitstream mapping size=%zu cpu=%px dma=%pad\n",
+	       c->bs.size, c->bs.cpu, &c->bs.dma);
+	if (c->bs.cpu) {
+		vdec_state(c, "booted");
 		return 0;
+	}
 	/* A session without its bitstream buffer must not be left half
 	 * initialized: a later CAPTURE restart would otherwise reuse it and
 	 * write through the missing mapping.
@@ -156,6 +196,7 @@ static int session_boot(struct vdec_ctx *c)
 	if (ret)
 		return ret;
 	cmpxchg(&c->dev->ctx, c, NULL);
+	VCPDBG("boot: no bitstream mapping, session rolled back\n");
 	return -ENOMEM;
 }
 
@@ -164,12 +205,18 @@ static int session_start(struct vdec_ctx *c)
 	/* A retained session is only usable once firmware and bitstream DMA
 	 * both exist.
 	 */
-	if (c->decoder)
+	if (c->decoder) {
+		VCPDBG("start: retained session init=%d bs=%px\n",
+		       c->initialized, c->bs.cpu);
 		return c->initialized && c->bs.cpu ? 0 : -EIO;
+	}
 	/* Other file handles may inspect formats, but only one owns VDEC. */
-	if (cmpxchg(&c->dev->ctx, NULL, c))
+	if (cmpxchg(&c->dev->ctx, NULL, c)) {
+		VCPDBG("start: device already owned by %px\n", c->dev->ctx);
 		return -EBUSY;
+	}
 	if (!mtk_vcp_is_offline(c->dev->vcp)) {
+		VCPDBG("start: vcp still busy, refusing to join\n");
 		cmpxchg(&c->dev->ctx, c, NULL);
 		return -EBUSY;
 	}
@@ -185,17 +232,24 @@ static int session_teardown(struct vdec_ctx *c)
 
 	if (!c->decoder)
 		return 0;
+	VCPDBG("teardown: init=%d boot=%d orphan=%d\n", c->initialized,
+	       c->booted, c->orphan);
 	if (c->initialized)
 		ret = mtk_vcp_vdec_deinit(c->decoder);
 	else
 		ret = -EIO;
 	stopped = c->booted ? mtk_vcp_shutdown(c->dev->vcp) : 0;
 	if (stopped || (ret && !mtk_vcp_is_offline(c->dev->vcp)) ||
-	    mtk_vcp_vdec_hw_stop(c->dev->hw))
+	    mtk_vcp_vdec_hw_stop(c->dev->hw)) {
+		VCPDBG("teardown: retain (deinit=%d shutdown=%d offline=%d)\n",
+		       ret, stopped, mtk_vcp_is_offline(c->dev->vcp));
 		goto retain;
+	}
 	stopped = mtk_vcp_vdec_destroy(c->decoder, !!ret);
-	if (stopped)
+	if (stopped) {
+		VCPDBG("teardown: destroy failed: %d\n", stopped);
 		goto retain;
+	}
 	c->decoder = NULL;
 	c->booted = false;
 	c->initialized = false;
@@ -210,6 +264,7 @@ static int session_teardown(struct vdec_ctx *c)
 	c->pool_count = 0;
 	c->pending_count = 0;
 	c->pending_read = 0;
+	VCPDBG("teardown: complete\n");
 	return 0;
 retain:
 	if (!c->orphan) {
@@ -224,6 +279,7 @@ static int session_stop(struct vdec_ctx *c)
 {
 	int ret = session_teardown(c);
 
+	VCPDBG("stop: teardown=%d\n", ret);
 	if (ret)
 		return ret;
 	cmpxchg(&c->dev->ctx, c, NULL);
@@ -237,27 +293,40 @@ static int collect_events(struct vdec_ctx *c)
 	unsigned int i;
 
 	while (!(ret = mtk_vcp_vdec_event(c->decoder, &event))) {
+		VCPDBG("event: type=%d cookie=%#llx source_cookie=%#llx\n",
+		       event.type, event.cookie, c->source_cookie);
 		if (event.type == VCP_VDEC_FREE_BITSTREAM) {
-			if (event.cookie != c->source_cookie)
+			if (event.cookie != c->source_cookie) {
+				VCPDBG("event: bitstream cookie mismatch\n");
 				return -EPROTO;
+			}
 			c->source_done = true;
 			continue;
 		}
 		for (i = 0; i < c->pool_count; i++)
 			if (c->surfaces[i].cookie == event.cookie)
 				break;
-		if (i == c->pool_count)
+		if (i == c->pool_count) {
+			VCPDBG("event: unknown cookie, pool=%u\n", c->pool_count);
 			return -EPROTO;
+		}
 		if (event.type == VCP_VDEC_FREE_FRAME) {
 			c->surfaces[i].free = true;
 			continue;
 		}
-		if (c->pending_count == DEC_SURFACES || c->surfaces[i].pending)
+		if (c->pending_count == DEC_SURFACES || c->surfaces[i].pending) {
+			VCPDBG("event: overflow, pending=%u surface=%u\n",
+			       c->pending_count, i);
 			return -EOVERFLOW;
+		}
 		c->surfaces[i].pending = true;
 		c->pending[(c->pending_read + c->pending_count++) % DEC_SURFACES] =
 			(struct vdec_pending){ .surface = i, .timestamp = event.timestamp };
+		VCPDBG("event: display surface=%u pending=%u ts=%llu\n", i,
+		       c->pending_count, event.timestamp);
 	}
+	if (ret != -EAGAIN)
+		VCPDBG("events: stopped with %d\n", ret);
 	return ret == -EAGAIN ? 0 : ret;
 }
 
@@ -292,6 +361,8 @@ static int deliver_frames(struct vdec_ctx *c)
 {
 	struct vb2_v4l2_buffer *vb;
 
+	VCPDBG("deliver: in pending=%u dstq=%u\n", c->pending_count,
+	       v4l2_m2m_num_dst_bufs_ready(c->fh.m2m_ctx));
 	while (c->pending_count && (vb = v4l2_m2m_next_dst_buf(c->fh.m2m_ctx))) {
 		struct vdec_pending *p = &c->pending[c->pending_read];
 		struct vdec_surface *s = &c->surfaces[p->surface];
@@ -302,6 +373,8 @@ static int deliver_frames(struct vdec_ctx *c)
 		 * back instead of written past its end.
 		 */
 		if (!capture_fits(c, vb)) {
+			VCPDBG("deliver: capture buffer too small for %ux%u\n",
+			       c->pic.width, c->pic.height);
 			v4l2_m2m_buf_done(vb, VB2_BUF_STATE_ERROR);
 			continue;
 		}
@@ -342,7 +415,11 @@ static int deliver_frames(struct vdec_ctx *c)
 		c->pending_read = (c->pending_read + 1) % DEC_SURFACES;
 		c->pending_count--;
 		v4l2_m2m_buf_done(vb, VB2_BUF_STATE_DONE);
+		VCPDBG("deliver: frame seq=%u ts=%llu left=%u\n", vb->sequence,
+		       vb->vb2_buf.timestamp, c->pending_count);
 	}
+	VCPDBG("deliver: out pending=%u dstq=%u\n", c->pending_count,
+	       v4l2_m2m_num_dst_bufs_ready(c->fh.m2m_ctx));
 	return 0;
 }
 
@@ -360,8 +437,11 @@ static int queue_surfaces(struct vdec_ctx *c)
 		s->cookie = ++c->next_cookie;
 		ret = mtk_vcp_vdec_frame(c->decoder, s->cookie, i,
 					 s->plane[0].dma, s->plane[1].dma);
-		if (ret)
+		if (ret) {
+			VCPDBG("surfaces: queue frame %u failed: %d\n", i, ret);
 			return ret;
+		}
+		VCPDBG("surfaces: queued %u cookie=%#llx\n", i, s->cookie);
 	}
 	return 0;
 }
@@ -373,8 +453,11 @@ static bool surfaces_idle(struct vdec_ctx *c)
 	if (c->pending_count)
 		return false;
 	for (i = 0; i < c->pool_count; i++)
-		if (!c->surfaces[i].free)
+		if (!c->surfaces[i].free) {
+			VCPDBG("surfaces_idle: %u of %u still owned by firmware\n", i,
+			       c->pool_count);
 			return false;
+		}
 	return true;
 }
 
@@ -390,6 +473,7 @@ static int finish_old_sequence(struct vdec_ctx *c)
 
 	if (!dst) {
 		c->last_pending = true;
+		VCPDBG("last: no capture buffer available, deferring the LAST marker\n");
 		return 0;
 	}
 	vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
@@ -417,9 +501,12 @@ static int res_change_restart(struct vdec_ctx *c, struct vb2_v4l2_buffer *src)
 	int seq, ret;
 
 	dev_info(c->dev->dev, "res_change: draining old resolution\n");
+	vdec_state(c, "res_change/in");
 	ret = mtk_vcp_vdec_reset(c->decoder, true);
-	if (ret)
+	if (ret) {
+		VCPDBG("res_change: drain reset failed: %d\n", ret);
 		return ret;
+	}
 	/* The flush dropped the queued access unit inside firmware; its release
 	 * is not delivered any more.
 	 */
@@ -450,9 +537,12 @@ static int res_change_restart(struct vdec_ctx *c, struct vb2_v4l2_buffer *src)
 	 * them and drops the queued new-resolution access unit, which the
 	 * next job resubmits through the header path.
 	 */
+	VCPDBG("res_change: drain done, pending=%u\n", c->pending_count);
 	ret = mtk_vcp_vdec_reset(c->decoder, false);
-	if (ret)
+	if (ret) {
+		VCPDBG("res_change: flush reset failed: %d\n", ret);
 		return ret;
+	}
 	deadline = jiffies + msecs_to_jiffies(2000);
 	seq = atomic_read(&c->notification);
 	for (;;) {
@@ -465,20 +555,27 @@ static int res_change_restart(struct vdec_ctx *c, struct vb2_v4l2_buffer *src)
 			break;
 		if (READ_ONCE(c->stopping))
 			return -ECANCELED;
-		if (time_after_eq(jiffies, deadline))
+		if (time_after_eq(jiffies, deadline)) {
+			VCPDBG("res_change: surfaces never went idle\n");
 			return -ETIMEDOUT;
+		}
 		wait_event_timeout(c->wait,
 				   atomic_read(&c->notification) != seq ||
 				   READ_ONCE(c->stopping),
 				   msecs_to_jiffies(20));
 		seq = atomic_read(&c->notification);
 	}
+	VCPDBG("res_change: surfaces idle, rebuilding the session\n");
 	ret = session_teardown(c);
-	if (ret)
+	if (ret) {
+		VCPDBG("res_change: teardown failed: %d\n", ret);
 		return ret;
+	}
 	ret = session_boot(c);
-	if (ret)
+	if (ret) {
+		VCPDBG("res_change: session reboot failed: %d\n", ret);
 		return ret;
+	}
 	dev_info(c->dev->dev, "res_change: session rebuilt\n");
 	c->header = false;
 	m->ignore_cap_streaming = true;
@@ -487,11 +584,14 @@ static int res_change_restart(struct vdec_ctx *c, struct vb2_v4l2_buffer *src)
 	 */
 	if (src) {
 		ret = parse_headers(c, src);
-		if (ret && ret != -EAGAIN)
+		if (ret && ret != -EAGAIN) {
+			VCPDBG("res_change: header reparse failed: %d\n", ret);
 			return ret;
+		}
 	}
 	/* The new resolution is decoded once the client restarts CAPTURE. */
 	c->wait_capture = true;
+	vdec_state(c, "res_change/out");
 	return finish_old_sequence(c);
 }
 
@@ -566,6 +666,8 @@ static int submit_source(struct vdec_ctx *c, struct vb2_v4l2_buffer *src, u32 *c
 	memcpy(c->bs.cpu, data + p->data_offset, bytes);
 	c->source_cookie = ++c->next_cookie;
 	c->source_done = false;
+	VCPDBG("submit: bytes=%u offset=%u cookie=%#llx\n", bytes,
+	       p->data_offset, c->source_cookie);
 	dma_wmb();
 	{ u8 *b8 = c->bs.cpu;
 	dev_info(c->dev->dev, "submit bytes=%u head=%*ph\n", bytes,
@@ -592,15 +694,22 @@ static int parse_headers(struct vdec_ctx *c, struct vb2_v4l2_buffer *src)
 	ret = submit_source(c, src, &changed);
 	if (ret) {
 		dev_info(c->dev->dev, "header submit failed: %d\n", ret);
+		VCPDBG("parse: header submit failed: %d\n", ret);
 		return ret;
 	}
 	/* The parse pass is not the decode pass that follows it. */
 	c->submitted = false;
-	if (!(changed & BIT(0)))
+	VCPDBG("parse: changed=%#x\n", changed);
+	if (!(changed & BIT(0))) {
+		VCPDBG("parse: no picture yet, need another access unit\n");
 		return -EAGAIN;
+	}
 	ret = collect_events(c);
 	if (!ret)
 		ret = mtk_vcp_vdec_picture(c->decoder, &c->pic);
+	VCPDBG("parse: picture %ux%u dpb=%u stride=%u bh=%u ret=%d\n",
+	       c->pic.width, c->pic.height, c->pic.dpb, c->pic.stride,
+	       c->pic.buffer_height, ret);
 	/* The picture geometry is known from here on. H.264 carries its frame rate
 	 * in the VUI, which this frontend does not parse, so the request assumes the
 	 * panel rate; whether that workload has an operating point at all is decided
@@ -612,8 +721,11 @@ static int parse_headers(struct vdec_ctx *c, struct vb2_v4l2_buffer *src)
 		ret = mtk_vcp_vdec_hw_set_perf(c->dev->hw, c->pic.width, c->pic.height, 60);
 	if (!ret)
 		ret = allocate_surfaces(c);
-	if (ret)
+	if (ret) {
+		VCPDBG("parse: picture/perf/surfaces failed: %d\n", ret);
 		return ret;
+	}
+	VCPDBG("parse: surfaces allocated, pool=%u\n", c->pool_count);
 	capture_format(c);
 	c->header = true;
 	c->fh.m2m_ctx->ignore_cap_streaming = false;
@@ -632,47 +744,63 @@ static void decode_work(struct work_struct *work)
 	u32 changed;
 	int ret = 0;
 
+	vdec_state(c, "work/in");
 	if (READ_ONCE(c->stopping))
 		goto finish;
 	ret = session_start(c);
-	if (ret)
+	if (ret) {
+		VCPDBG("work: session_start failed: %d\n", ret);
 		goto error;
+	}
+	VCPDBG("work: session ready\n");
 	/* A resolution change ends the previous capture sequence before any frame
 	 * of the new one is decoded; the marker may have been deferred until a
 	 * capture buffer became available.
 	 */
 	if (READ_ONCE(c->last_pending)) {
+		VCPDBG("work: deferred LAST marker, finishing the old sequence\n");
 		ret = finish_old_sequence(c);
 		if (ret)
 			goto error;
 		goto finish;
 	}
-	if (READ_ONCE(c->wait_capture))
+	if (READ_ONCE(c->wait_capture)) {
+		VCPDBG("work: waiting for the client to restart CAPTURE\n");
 		goto finish;
+	}
 	src = v4l2_m2m_next_src_buf(m);
 	if (!c->header) {
-		if (!src)
+		if (!src) {
+			VCPDBG("work: header pass, nothing queued on OUTPUT\n");
 			goto finish;
+		}
+		VCPDBG("work: header pass over output buffer %u\n", src->vb2_buf.index);
 		ret = parse_headers(c, src);
 		if (ret == -EAGAIN) {
 			/* Incomplete sequence headers are consumed before
 			 * capture starts.
 			 */
+			VCPDBG("work: incomplete sequence, consuming the buffer\n");
 			src = v4l2_m2m_src_buf_remove(m);
 			v4l2_m2m_buf_done(src, VB2_BUF_STATE_DONE);
 			ret = 0;
 		}
-		if (ret)
+		if (ret) {
+			VCPDBG("work: header pass failed: %d\n", ret);
 			goto error;
+		}
 		goto finish;
 	}
 	ret = collect_events(c);
 	if (!ret)
 		ret = deliver_frames(c);
-	if (ret)
+	if (ret) {
+		VCPDBG("work: event delivery failed: %d\n", ret);
 		goto error;
+	}
 	if (src && !c->drained) {
 		if (!vb2_get_plane_payload(&src->vb2_buf, 0)) {
+			VCPDBG("work: empty output buffer, entering drain\n");
 			c->draining = true;
 			src = v4l2_m2m_src_buf_remove(m);
 			v4l2_m2m_buf_done(src, VB2_BUF_STATE_DONE);
@@ -680,25 +808,33 @@ static void decode_work(struct work_struct *work)
 			goto drain;
 		}
 		ret = queue_surfaces(c);
-		if (ret)
+		if (ret) {
+			VCPDBG("work: queueing surfaces failed: %d\n", ret);
 			goto error;
+		}
 		if (!c->submitted) {
 			/* An earlier job may have handed this buffer to firmware
 			 * before STREAMOFF interrupted the wait for its release;
 			 * resubmitting it would decode the access unit twice.
 			 */
 			ret = submit_source(c, src, &changed);
-			if (ret)
+			if (ret) {
+				VCPDBG("work: submit failed: %d\n", ret);
 				goto error;
+			}
 			c->submitted = true;
+			VCPDBG("work: submitted, changed=%#x\n", changed);
 			if (changed & (BIT(2) | BIT(3))) {
+				VCPDBG("work: firmware reports a stream error\n");
 				ret = -EPIPE;
 				goto error;
 			}
 			if (changed & BIT(0)) {
 				ret = res_change_restart(c, src);
-				if (ret)
+				if (ret) {
+					VCPDBG("work: resolution change failed: %d\n", ret);
 					goto error;
+				}
 				goto finish;
 			}
 		}
@@ -709,13 +845,19 @@ static void decode_work(struct work_struct *work)
 			ret = collect_events(c);
 			if (!ret)
 				ret = deliver_frames(c);
-			if (ret)
+			if (ret) {
+				VCPDBG("work: wait loop delivery failed: %d\n", ret);
 				goto error;
+			}
 			if (c->source_done)
 				break;
-			if (READ_ONCE(c->stopping))
+			if (READ_ONCE(c->stopping)) {
+				VCPDBG("work: stopped while waiting for the bitstream\n");
 				goto finish;
+			}
 			if (time_after_eq(jiffies, deadline)) {
+				VCPDBG("work: timed out waiting for the bitstream release, submitted=%d notification=%d\n",
+				       c->submitted, atomic_read(&c->notification));
 				ret = -ETIMEDOUT;
 				goto error;
 			}
@@ -726,9 +868,12 @@ static void decode_work(struct work_struct *work)
 		src = v4l2_m2m_src_buf_remove(m);
 		src->sequence = c->source_sequence++;
 		v4l2_m2m_buf_done(src, VB2_BUF_STATE_DONE);
+		VCPDBG("work: source done, seq=%u pending=%u\n", src->sequence,
+		       c->pending_count);
 	}
 drain:
 	if (c->draining && !c->drained && !v4l2_m2m_num_src_bufs_ready(m)) {
+		VCPDBG("work: draining, flushing firmware\n");
 		ret = mtk_vcp_vdec_reset(c->decoder, true);
 		if (!ret)
 			ret = collect_events(c);
@@ -737,11 +882,13 @@ drain:
 		if (ret)
 			goto error;
 		c->drained = true;
+		VCPDBG("work: drained, pending=%u\n", c->pending_count);
 	}
 	if (c->drained && !c->pending_count) {
 		struct vb2_v4l2_buffer *dst = v4l2_m2m_dst_buf_remove(m);
 		const struct v4l2_event event = { .type = V4L2_EVENT_EOS };
 
+		VCPDBG("work: drain complete, dst=%s\n", dst ? "available" : "none");
 		if (dst) {
 			vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
 			if (c->dst_fmt.num_planes > 1)
@@ -754,24 +901,20 @@ drain:
 	goto finish;
 error:
 	dev_err(c->dev->dev, "decode failed: %d\n", ret);
+	vdec_state(c, "work/error");
 	WRITE_ONCE(c->failed, true);
 	vb2_queue_error(v4l2_m2m_get_src_vq(m));
 	vb2_queue_error(v4l2_m2m_get_dst_vq(m));
 finish:
 	v4l2_m2m_job_finish(c->dev->m2m, m);
+	VCPDBG("work: job finished\n");
 }
 
 static void device_run(void *priv)
 {
 	struct vdec_ctx *c = priv;
 
-	dev_info_ratelimited(c->dev->dev,
-			     "job run: header=%d src=%u dst=%u pending=%u draining=%d drained=%d\n",
-			     READ_ONCE(c->header),
-			     v4l2_m2m_num_src_bufs_ready(c->fh.m2m_ctx),
-			     v4l2_m2m_num_dst_bufs_ready(c->fh.m2m_ctx),
-			     READ_ONCE(c->pending_count),
-			     READ_ONCE(c->draining), READ_ONCE(c->drained));
+	vdec_state(c, "device_run");
 	queue_work(c->dev->queue, &c->work);
 }
 static int job_ready(void *priv)
@@ -779,40 +922,51 @@ static int job_ready(void *priv)
 	struct vdec_ctx *c = priv;
 	struct v4l2_m2m_ctx *m = c->fh.m2m_ctx;
 	bool src = v4l2_m2m_num_src_bufs_ready(m), dst = v4l2_m2m_num_dst_bufs_ready(m);
+	bool fits = dst ? capture_fits(c, v4l2_m2m_next_dst_buf(m)) : false;
+	int ready;
 
 	if (READ_ONCE(c->stopping) || READ_ONCE(c->failed))
-		return 0;
+		ready = 0;
 	/* The capture sequence of the previous resolution still needs its LAST
 	 * marker, which only needs a capture buffer to hand out.
 	 */
-	if (READ_ONCE(c->last_pending))
-		return dst;
+	else if (READ_ONCE(c->last_pending))
+		ready = dst;
 	/* A resolution change suspends decoding until the client restarts
 	 * CAPTURE, as the stateful decoder protocol requires.
 	 */
-	if (READ_ONCE(c->wait_capture))
-		return 0;
-	if (!READ_ONCE(c->header))
-		return src;
+	else if (READ_ONCE(c->wait_capture))
+		ready = 0;
+	else if (!READ_ONCE(c->header))
+		ready = src;
 	/* Decoding ahead of a capture renegotiation would hand the current
 	 * picture to buffers sized for the previous resolution; the header
 	 * pass already told the application about the change, so wait for it
 	 * to stop and restart the capture queue with matching buffers.
 	 */
-	if (dst && !capture_fits(c, v4l2_m2m_next_dst_buf(m)))
-		return 0;
-	if (READ_ONCE(c->pending_count) && dst)
-		return 1;
-	if (READ_ONCE(c->draining) && !READ_ONCE(c->drained) && !src)
-		return 1;
-	if (READ_ONCE(c->drained))
-		return !READ_ONCE(c->pending_count) && dst;
-	return src && dst;
+	else if (dst && !fits)
+		ready = 0;
+	else if (READ_ONCE(c->pending_count) && dst)
+		ready = 1;
+	else if (READ_ONCE(c->draining) && !READ_ONCE(c->drained) && !src)
+		ready = 1;
+	else if (READ_ONCE(c->drained))
+		ready = !READ_ONCE(c->pending_count) && dst;
+	else
+		ready = src && dst;
+
+	VCPDBG("job_ready: src=%u dst=%u fits=%d hdr=%d lastp=%d waitcap=%d pend=%u drn=%d drnd=%d stop=%d fail=%d sub=%d -> %d\n",
+	       src, dst, fits, READ_ONCE(c->header), READ_ONCE(c->last_pending),
+	       READ_ONCE(c->wait_capture), READ_ONCE(c->pending_count),
+	       READ_ONCE(c->draining), READ_ONCE(c->drained),
+	       READ_ONCE(c->stopping), READ_ONCE(c->failed), c->submitted, ready);
+	return ready;
 }
 static void job_abort(void *priv)
 {
 	struct vdec_ctx *c = priv;
 
+	vdec_state(c, "job_abort");
 	WRITE_ONCE(c->stopping, true);
 	wake_up(&c->wait);
 }
@@ -833,11 +987,16 @@ static int queue_setup(struct vb2_queue *q, unsigned int *buffers,
 		for (i = 0; i < *planes; i++)
 			if (sizes[i] < f->plane_fmt[i].sizeimage)
 				return -EINVAL;
+		VCPDBG("queue_setup: %u bufs, %u planes accepted\n", *buffers,
+		       *planes);
 		return 0;
 	}
 	*planes = f->num_planes;
 	for (i = 0; i < *planes; i++)
 		sizes[i] = f->plane_fmt[i].sizeimage;
+	VCPDBG("queue_setup: %u bufs, configuring %u planes (%ux%u size=%u/%u)\n",
+	       *buffers, *planes, f->width, f->height, sizes[0],
+	       *planes > 1 ? sizes[1] : 0);
 	return 0;
 }
 static int buffer_prepare(struct vb2_buffer *vb)
@@ -846,13 +1005,24 @@ static int buffer_prepare(struct vb2_buffer *vb)
 	struct v4l2_pix_format_mplane *f = queue_format(c, vb->type);
 	unsigned int i;
 
-	for (i = 0; i < f->num_planes; i++)
-		if (vb2_plane_size(vb, i) < f->plane_fmt[i].sizeimage)
+	for (i = 0; i < f->num_planes; i++) {
+		if (vb2_plane_size(vb, i) < f->plane_fmt[i].sizeimage) {
+			VCPDBG("prepare: %s buf %u plane %u too small: have=%lu need=%u, geometry %ux%u\n",
+			       is_output(vb->type) ? "output" : "capture",
+			       vb->index, i, vb2_plane_size(vb, i),
+			       f->plane_fmt[i].sizeimage, f->width, f->height);
 			return -EINVAL;
+		}
+	}
 	if (is_output(vb->type) &&
 	    (vb->planes[0].data_offset > vb2_get_plane_payload(vb, 0) ||
-	     vb2_get_plane_payload(vb, 0) > vb2_plane_size(vb, 0)))
+	     vb2_get_plane_payload(vb, 0) > vb2_plane_size(vb, 0))) {
+		VCPDBG("prepare: output buf %u bad offset/payload\n", vb->index);
 		return -EINVAL;
+	}
+	VCPDBG("prepare: %s buf %u ok, %ux%u planes=%u\n",
+	       is_output(vb->type) ? "output" : "capture", vb->index,
+	       f->width, f->height, f->num_planes);
 	return 0;
 }
 static void buffer_queue(struct vb2_buffer *vb)
@@ -860,6 +1030,10 @@ static void buffer_queue(struct vb2_buffer *vb)
 	struct vdec_ctx *c = vb2_get_drv_priv(vb->vb2_queue);
 
 	v4l2_m2m_buf_queue(c->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
+	VCPDBG("queue: %s buf %u queued (srcq=%u dstq=%u)\n",
+	       is_output(vb->type) ? "output" : "capture", vb->index,
+	       v4l2_m2m_num_src_bufs_ready(c->fh.m2m_ctx),
+	       v4l2_m2m_num_dst_bufs_ready(c->fh.m2m_ctx));
 }
 
 /* LAST sets the mem2mem has_stopped flag, which suppresses all further
@@ -872,22 +1046,29 @@ static int resume_streaming(struct vdec_ctx *c)
 	struct v4l2_m2m_ctx *m = c->fh.m2m_ctx;
 	int ret;
 
+	VCPDBG("resume: has_stopped=%d drained=%d\n",
+	       v4l2_m2m_has_stopped(m), c->drained);
 	if (!v4l2_m2m_has_stopped(m))
 		return 0;
 	if (READ_ONCE(c->drained) && c->decoder) {
 		/* LAST disables scheduling; join the worker before resetting. */
 		flush_work(&c->work);
 		ret = mtk_vcp_vdec_reset(c->decoder, false);
-		if (ret)
+		if (ret) {
+			VCPDBG("resume: firmware reset failed: %d\n", ret);
 			return ret;
+		}
 		ret = collect_events(c);
-		if (ret)
+		if (ret) {
+			VCPDBG("resume: event collection failed: %d\n", ret);
 			return ret;
+		}
 	}
 	/* A stopped queue owns no more buffers; the last one was already
 	 * dequeued or is being discarded by the queue restart.
 	 */
 	vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(m));
+	VCPDBG("resume: mem2mem stopped state cleared\n");
 	return 0;
 }
 
@@ -896,8 +1077,12 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
 	struct vdec_ctx *c = vb2_get_drv_priv(q);
 	int ret;
 
-	if (c->orphan)
+	VCPDBG("start_streaming: %s count=%u\n",
+	       is_output(q->type) ? "output" : "capture", count);
+	if (c->orphan) {
+		VCPDBG("start_streaming: orphan session refused\n");
 		return -EIO;
+	}
 	WRITE_ONCE(c->stopping, false);
 	WRITE_ONCE(c->failed, false);
 	if (is_output(q->type)) {
@@ -906,6 +1091,7 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
 		c->submitted = false;
 		c->wait_capture = false;
 		v4l2_m2m_clear_state(c->fh.m2m_ctx);
+		vdec_state(c, "start_streaming/output");
 		return 0;
 	}
 	/* Restarting CAPTURE is how a client resumes after a drain or after a
@@ -914,18 +1100,25 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
 	 */
 	c->wait_capture = false;
 	ret = resume_streaming(c);
-	if (ret)
+	if (ret) {
+		VCPDBG("start_streaming: resume failed: %d\n", ret);
 		return ret;
+	}
 	c->draining = false;
 	c->drained = false;
 	v4l2_m2m_clear_state(c->fh.m2m_ctx);
+	vdec_state(c, "start_streaming/capture");
 	return 0;
 }
 static void stop_streaming(struct vb2_queue *q)
 {
 	struct vdec_ctx *c = vb2_get_drv_priv(q);
 	struct vb2_v4l2_buffer *vb;
+	unsigned int dropped = 0;
 
+	VCPDBG("stop_streaming: %s entry\n",
+	       is_output(q->type) ? "output" : "capture");
+	vdec_state(c, "stop_streaming/in");
 	WRITE_ONCE(c->stopping, true);
 	wake_up(&c->wait);
 	flush_work(&c->work);
@@ -933,17 +1126,28 @@ static void stop_streaming(struct vb2_queue *q)
 		/* Capture re-setup (e.g. after SOURCE_CHANGE) keeps the
 		 * firmware session alive; output STREAMOFF or release ends it.
 		 */
-		while ((vb = v4l2_m2m_dst_buf_remove(c->fh.m2m_ctx)))
+		while ((vb = v4l2_m2m_dst_buf_remove(c->fh.m2m_ctx))) {
 			v4l2_m2m_buf_done(vb, VB2_BUF_STATE_ERROR);
+			dropped++;
+		}
+		VCPDBG("stop_streaming: capture, dropped=%u lastp=%d waitcap=%d\n",
+		       dropped, c->last_pending, c->wait_capture);
 		return;
 	}
 	session_stop(c);
-	while ((vb = v4l2_m2m_src_buf_remove(c->fh.m2m_ctx)))
+	while ((vb = v4l2_m2m_src_buf_remove(c->fh.m2m_ctx))) {
 		v4l2_m2m_buf_done(vb, VB2_BUF_STATE_ERROR);
-	while ((vb = v4l2_m2m_dst_buf_remove(c->fh.m2m_ctx)))
+		dropped++;
+	}
+	while ((vb = v4l2_m2m_dst_buf_remove(c->fh.m2m_ctx))) {
 		v4l2_m2m_buf_done(vb, VB2_BUF_STATE_ERROR);
+		dropped++;
+	}
 	c->header = false;
 	c->fh.m2m_ctx->ignore_cap_streaming = true;
+	VCPDBG("stop_streaming: output, dropped=%u lastp=%d waitcap=%d\n",
+	       dropped, c->last_pending, c->wait_capture);
+	vdec_state(c, "stop_streaming/out");
 }
 static const struct vb2_ops queue_ops = {
 	.queue_setup = queue_setup, .buf_prepare = buffer_prepare, .buf_queue = buffer_queue,
@@ -1121,24 +1325,32 @@ static int decoder_cmd(struct file *file, void *priv, struct v4l2_decoder_cmd *c
 	struct vdec_ctx *c = file_ctx(file);
 	int ret = v4l2_m2m_ioctl_try_decoder_cmd(file, priv, cmd);
 
+	VCPDBG("decoder_cmd: cmd=%u\n", cmd->cmd);
 	if (ret)
 		return ret;
 	if (cmd->cmd == V4L2_DEC_CMD_STOP) {
 		c->draining = true;
+		vdec_state(c, "decoder_cmd/stop");
 	} else if (cmd->cmd == V4L2_DEC_CMD_START) {
-		if (READ_ONCE(c->draining) && !v4l2_m2m_has_stopped(c->fh.m2m_ctx))
+		if (READ_ONCE(c->draining) && !v4l2_m2m_has_stopped(c->fh.m2m_ctx)) {
+			VCPDBG("decoder_cmd: START while draining and not stopped\n");
 			return -EBUSY;
+		}
 		ret = resume_streaming(c);
-		if (ret)
+		if (ret) {
+			VCPDBG("decoder_cmd: resume failed: %d\n", ret);
 			return ret;
+		}
 		c->draining = false;
 		c->drained = false;
 		c->wait_capture = false;
 		v4l2_m2m_clear_state(c->fh.m2m_ctx);
+		vdec_state(c, "decoder_cmd/start");
 	} else {
 		return -EINVAL;
 	}
 	v4l2_m2m_try_schedule(c->fh.m2m_ctx);
+	VCPDBG("decoder_cmd: done, ret=%d\n", ret);
 	return 0;
 }
 static const struct v4l2_ioctl_ops ioctl_ops = {
@@ -1206,6 +1418,8 @@ static int vdec_open(struct file *file)
 	v4l2_m2m_set_dst_buffered(c->fh.m2m_ctx, true);
 	v4l2_fh_add(&c->fh, file);
 	mutex_unlock(&d->lock);
+	VCPDBG("open: new context %px, source %ux%u\n", c, c->src_fmt.width,
+	       c->src_fmt.height);
 	return 0;
 free:
 	v4l2_ctrl_handler_free(&c->controls);
@@ -1221,6 +1435,7 @@ static int vdec_release(struct file *file)
 	struct vdec_dev *d = c->dev;
 
 	mutex_lock(&d->lock);
+	vdec_state(c, "release/in");
 	WRITE_ONCE(c->stopping, true);
 	wake_up(&c->wait);
 	v4l2_m2m_ctx_release(c->fh.m2m_ctx);
@@ -1232,6 +1447,7 @@ static int vdec_release(struct file *file)
 	if (!c->orphan)
 		kfree(c);
 	mutex_unlock(&d->lock);
+	VCPDBG("release: done\n");
 	return 0;
 }
 static const struct v4l2_file_operations file_ops = {

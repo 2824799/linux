@@ -50,6 +50,9 @@
 #define VCP_DEC_MEM_ALLOC_DONE  0xd005
 #define VCP_MEM_SHARED          6
 
+/* DEBUG: temporary transport tracing, remove before submission. */
+#define VCPDBG(fmt, ...) pr_info("VCPDBG:%s: " fmt, __func__, ##__VA_ARGS__)
+
 struct vcp_message {
 	__le32 id;
 	__le32 len;
@@ -133,6 +136,8 @@ static int vcp_smc(struct mtk_vcp *vcp, u32 function, u32 op, u32 arg)
 	struct arm_smccc_res res;
 
 	arm_smccc_smc(function, op, arg, 0, 0, 0, 0, 0, &res);
+	VCPDBG("smc: function=%#x op=%u arg=%u -> %ld\n", function, op, arg,
+	       (long)res.a0);
 	if ((long)res.a0) {
 		dev_err(vcp->dev, "secure call %#x/%u failed: %ld\n",
 			function, op, (long)res.a0);
@@ -144,7 +149,9 @@ static int vcp_smc(struct mtk_vcp *vcp, u32 function, u32 op, u32 arg)
 /* Both ready variants carry TCM size; only READY_1 establishes readiness. */
 static void vcp_ready(struct mtk_vcp *vcp, u32 size, bool ready1)
 {
+	VCPDBG("ready: ready1=%d tcm=%u\n", ready1, size);
 	if (size != VCP_TCM_SIZE) {
+		VCPDBG("ready: unexpected TCM size %u\n", size);
 		WRITE_ONCE(vcp->boot_error, -EPROTO);
 		complete(&vcp->ready);
 		return;
@@ -152,6 +159,7 @@ static void vcp_ready(struct mtk_vcp *vcp, u32 size, bool ready1)
 	if (!ready1)
 		return;
 	writel(0xff, vcp->cfg + VCP_SPM_CLR);
+	VCPDBG("ready: firmware is up\n");
 	complete(&vcp->ready);
 }
 
@@ -232,6 +240,7 @@ static void vcp_codec_receive(struct mtk_vcp *vcp, unsigned int codec,
 	u32 len = le32_to_cpu(msg->len);
 	u32 service = le32_to_cpu(msg->id);
 
+	VCPDBG("recv: codec%u service=%u len=%u\n", codec, service, len);
 	if ((codec == MTK_VCP_ENCODER ? service != 3 :
 	     (service != 1 && service != 2)) || len < sizeof(u32) ||
 	    len > sizeof(msg->data)) {
@@ -244,9 +253,11 @@ static void vcp_codec_receive(struct mtk_vcp *vcp, unsigned int codec,
 	mutex_lock(&vcp->handler_lock);
 	if (vcp->handler[codec])
 		vcp->handler[codec](vcp->handler_priv[codec], msg->data, len);
-	else
+	else {
+		VCPDBG("recv: codec%u has no registered handler\n", codec);
 		dev_warn_ratelimited(vcp->dev,
 				     "codec%u request has no protocol handler\n", codec);
+	}
 	mutex_unlock(&vcp->handler_lock);
 }
 
@@ -259,6 +270,7 @@ static irqreturn_t vcp_mbox_irq(int irq, void *priv)
 	status = readl(mbox->base + VCP_MBOX_CLR);
 	if (!status)
 		return IRQ_NONE;
+	VCPDBG("mbox%u: status=%#x\n", mbox->index, status);
 	/* Snapshot before acknowledging: firmware may reuse a slot immediately. */
 	__ioread32_copy(words, mbox->base, ARRAY_SIZE(words));
 	writel(status, mbox->base + VCP_MBOX_CLR);
@@ -289,6 +301,7 @@ static irqreturn_t vcp_mbox_irq(int irq, void *priv)
 	if (status & ~handled)
 		dev_warn_ratelimited(vcp->dev, "unhandled mailbox%u pins %#x\n",
 				     mbox->index, status & ~handled);
+	VCPDBG("mbox%u: handled=%#x\n", mbox->index, status & handled);
 	return IRQ_HANDLED;
 }
 
@@ -300,6 +313,7 @@ static irqreturn_t vcp_wdt_irq(int irq, void *priv)
 
 	if (!(readl(vcp->core + VCP_CORE_WDT) & BIT(0)))
 		return IRQ_NONE;
+	VCPDBG("watchdog fired, stopping=%d\n", READ_ONCE(vcp->stopping));
 	/* The firmware must finish its interrupt sequence before AP clears WDT. */
 	ret = readl_poll_timeout(vcp->core + VCP_CORE_REBOOT, value,
 				 value == 0x34, 10, 50000);
@@ -488,9 +502,12 @@ static int vcp_assert_reset(struct mtk_vcp *vcp, bool graceful)
 {
 	int ret;
 
+	VCPDBG("assert_reset: graceful=%d\n", graceful);
 	ret = vcp_smc(vcp, VCP_CONTROL, VCP_RESET_SET, graceful);
-	if (ret)
+	if (ret) {
+		VCPDBG("assert_reset: reset request failed: %d\n", ret);
 		return ret;
+	}
 	vcp->reset_confirmed = true;
 	if (vcp->security_enabled) {
 		ret = vcp_smc(vcp, VCP_DAPC_CONTROL, 0, 0);
@@ -509,6 +526,7 @@ static int vcp_start(struct rproc *rproc)
 	reinit_completion(&vcp->ready);
 	WRITE_ONCE(vcp->boot_error, 0);
 	WRITE_ONCE(vcp->stopping, false);
+	VCPDBG("start: booting the firmware\n");
 	ret = clk_set_parent(vcp->clocks[2].clk, vcp->clocks[0].clk);
 	if (ret)
 		return ret;
@@ -545,12 +563,16 @@ static int vcp_start(struct rproc *rproc)
 		goto reset;
 	ready = wait_for_completion_timeout(&vcp->ready, msecs_to_jiffies(4000));
 	ret = ready ? READ_ONCE(vcp->boot_error) : -ETIMEDOUT;
+	VCPDBG("start: ready wait returned %lu, boot_error=%d, ret=%d\n", ready,
+	       READ_ONCE(vcp->boot_error), ret);
 	if (!ret) {
 		dev_info(vcp->dev, "VCP READY_1 received; shared IOVA %pad..%pad\n",
 			 &vcp->shm_lower, &vcp->shm_upper);
+		VCPDBG("start: firmware running\n");
 		return 0;
 	}
 reset:
+	VCPDBG("start: failed with %d, tearing the firmware down\n", ret);
 	WRITE_ONCE(vcp->stopping, true);
 	mutex_lock(&vcp->send_lock);
 	vcp->tx_enabled = false;
@@ -578,6 +600,7 @@ static int vcp_stop(struct rproc *rproc)
 	if (!ret)
 		ret = readl_poll_timeout(vcp->core + VCP_CORE_STATUS, value,
 					value == 7, 1000, 500000);
+	VCPDBG("stop: handshake ret=%d, core status %#x\n", ret, value);
 	return vcp_assert_reset(vcp, !ret);
 }
 
@@ -621,13 +644,25 @@ EXPORT_SYMBOL_GPL(mtk_vcp_put);
 
 int mtk_vcp_boot(struct mtk_vcp *vcp)
 {
-	return rproc_boot(vcp->rproc);
+	int ret;
+
+	VCPDBG("boot: state=%d, requesting\n", vcp->rproc->state);
+	ret = rproc_boot(vcp->rproc);
+	VCPDBG("boot: -> %d, state=%d powered=%d\n", ret, vcp->rproc->state,
+	       vcp->powered);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(mtk_vcp_boot);
 
 int mtk_vcp_shutdown(struct mtk_vcp *vcp)
 {
-	return rproc_shutdown(vcp->rproc);
+	int ret;
+
+	VCPDBG("shutdown: state=%d\n", vcp->rproc->state);
+	ret = rproc_shutdown(vcp->rproc);
+	VCPDBG("shutdown: -> %d, state=%d powered=%d\n", ret,
+	       vcp->rproc->state, vcp->powered);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(mtk_vcp_shutdown);
 
@@ -638,6 +673,7 @@ bool mtk_vcp_is_offline(struct mtk_vcp *vcp)
 	mutex_lock(&vcp->rproc->lock);
 	offline = vcp->rproc->state == RPROC_OFFLINE && !vcp->powered;
 	mutex_unlock(&vcp->rproc->lock);
+	VCPDBG("is_offline: %d\n", offline);
 	return offline;
 }
 EXPORT_SYMBOL_GPL(mtk_vcp_is_offline);
@@ -726,8 +762,10 @@ static int vcp_ipi_send(struct mtk_vcp *vcp, unsigned int codec,
 	msg.id = cpu_to_le32(service);
 	msg.len = cpu_to_le32(len);
 	memcpy(msg.data, data, len);
+	VCPDBG("ipi: codec%u service=%u len=%zu\n", codec, service, len);
 	mutex_lock(&vcp->send_lock);
 	if (!vcp->tx_enabled) {
+		VCPDBG("ipi: transport is down\n");
 		ret = -EHOSTDOWN;
 		goto out;
 	}
@@ -744,6 +782,7 @@ static int vcp_ipi_send(struct mtk_vcp *vcp, unsigned int codec,
 				50, 100000);
 out:
 	mutex_unlock(&vcp->send_lock);
+	VCPDBG("ipi: service=%u -> %d\n", service, ret);
 	return ret;
 }
 int mtk_vcp_ipi_send(struct mtk_vcp *vcp, unsigned int codec,

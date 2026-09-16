@@ -18,6 +18,9 @@
 /* Highest operating point of the vendor OPP table: 660 MHz at 750 mV. */
 #define VDEC_MAX_RATE 660000000UL
 
+/* DEBUG: temporary hardware tracing, remove before submission. */
+#define VCPDBG(fmt, ...) pr_info("VCPDBG:%s: " fmt, __func__, ##__VA_ARGS__)
+
 struct vdec_core {
 	void __iomem *misc;
 	struct device *domain, *larb;
@@ -59,6 +62,7 @@ static irqreturn_t vdec_irq(int irq, void *priv)
 
 	if (!(status & BIT(16)))
 		return IRQ_NONE;
+	VCPDBG("irq: irq=%d status=%#x\n", c->irq, status);
 	writel(status | 0x11, c->misc + 0xa4);
 	writel(readl(c->misc + 0xa4) & ~0x10, c->misc + 0xa4);
 	complete(&c->irq_done);
@@ -185,6 +189,9 @@ int mtk_vcp_vdec_hw_power(struct mtk_vcp_vdec_hw *hw, unsigned int core, bool on
 {
 	int ret;
 
+	VCPDBG("power: core%u on=%d (owned=%d/%d retained=%d uncertain=%d)\n",
+	       core, on, hw->core[0].owned, hw->core[1].owned, hw->retained,
+	       hw->uncertain);
 	if (core >= 2 || hw->uncertain)
 		return -EINVAL;
 	if (on) {
@@ -192,20 +199,29 @@ int mtk_vcp_vdec_hw_power(struct mtk_vcp_vdec_hw *hw, unsigned int core, bool on
 		 * state; powering them again would run at a step this driver cannot
 		 * vouch for.
 		 */
-		if (hw->retained)
+		if (hw->retained) {
+			VCPDBG("power: core%u refused, previous shutdown uncertain\n",
+			       core);
 			return -EIO;
-		if (hw->core[core].owned)
+		}
+		if (hw->core[core].owned) {
+			VCPDBG("power: core%u already owned\n", core);
 			return -EBUSY;
+		}
 		ret = vdec_power_on(hw);
-		if (ret)
+		if (ret) {
+			VCPDBG("power: core%u bring-up failed: %d\n", core, ret);
 			return ret;
+		}
 	} else if (!hw->core[core].owned) {
+		VCPDBG("power: core%u was not owned\n", core);
 		return -EINVAL;
 	}
 	/* Firmware owns the interrupt except for explicit WAITISR requests.
 	 * Keep the rails until the complete session has been deinitialized.
 	 */
 	hw->core[core].owned = on;
+	VCPDBG("power: core%u now %s\n", core, on ? "running" : "stopped");
 	return 0;
 }
 
@@ -222,8 +238,12 @@ int mtk_vcp_vdec_hw_wait(struct mtk_vcp_vdec_hw *hw, unsigned int core)
 	ret = wait_for_completion_timeout(&c->irq_done, msecs_to_jiffies(1000)) ?
 		0 : -ETIMEDOUT;
 	disable_irq(c->irq);
-	if (ret)
+	VCPDBG("wait: core%u -> %d\n", core, ret);
+	if (ret) {
+		VCPDBG("wait: core%u interrupt timed out, state now uncertain\n",
+		       core);
 		hw->uncertain = true;
+	}
 	return ret;
 }
 
@@ -252,8 +272,11 @@ int mtk_vcp_vdec_hw_set_perf(struct mtk_vcp_vdec_hw *hw, u32 width, u32 height,
 	u64 pixels;
 	int ret;
 
-	if (!width || !height || !fps)
+	VCPDBG("perf: requested %ux%u at %u fps\n", width, height, fps);
+	if (!width || !height || !fps) {
+		VCPDBG("perf: incomplete geometry\n");
 		return -EINVAL;
+	}
 	if (check_mul_overflow((u64)width, (u64)height, &pixels) ||
 	    check_mul_overflow(pixels, (u64)fps, &pixels))
 		return -ERANGE;
@@ -340,8 +363,13 @@ int mtk_vcp_vdec_hw_stop(struct mtk_vcp_vdec_hw *hw)
 {
 	int i, ret, error = 0;
 
-	if (hw->uncertain || hw->core[0].owned || hw->core[1].owned)
+	VCPDBG("stop: powered=%d owned=%d/%d retained=%d uncertain=%d\n",
+	       hw->powered, hw->core[0].owned, hw->core[1].owned, hw->retained,
+	       hw->uncertain);
+	if (hw->uncertain || hw->core[0].owned || hw->core[1].owned) {
+		VCPDBG("stop: cores still owned or state uncertain\n");
 		return -EBUSY;
+	}
 	if (!hw->powered) {
 		/* Nothing this driver powered is running, so the rail does not have
 		 * to keep serving this codec while it stays idle. The stream's step
