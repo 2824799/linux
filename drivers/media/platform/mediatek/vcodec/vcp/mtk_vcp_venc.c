@@ -565,6 +565,19 @@ static int venc_set_param(struct mtk_vcp_venc_inst *inst, u32 id,
 		return -EINVAL;
 	for (i = 0; i < count; i++)
 		msg.data[i] = cpu_to_le32(data[i]);
+	/* A frame rate is part of the workload the DVFSRC step was chosen for:
+	 * re-vote and re-check it before firmware is told about the new rate,
+	 * so a rate the rail cannot serve fails the request instead of
+	 * encoding at a rate nobody granted.
+	 */
+	if (id == VCP_VENC_PARAM_FRAMERATE && count == 1 && inst->vsi) {
+		ret = inst->enc->ops->set_perf(inst->enc->priv, inst->cookie,
+				       le32_to_cpu(inst->vsi->config.pic_w),
+				       le32_to_cpu(inst->vsi->config.pic_h),
+				       le32_to_cpu(msg.data[0]));
+		if (ret)
+			return ret;
+	}
 	ret = venc_call(inst, &msg, sizeof(msg), VCP_ENC_SET_PARAM_DONE);
 	if (!ret && inst->response_len != 16 && inst->response_len != 24 &&
 	    inst->response_len != 48)
