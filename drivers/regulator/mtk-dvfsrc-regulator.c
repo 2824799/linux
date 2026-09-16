@@ -27,6 +27,16 @@ struct dvfsrc_regulator_pdata {
 	u32 size;
 };
 
+/*
+ * Floor for a rail whose clocks are not managed by this driver.  The
+ * multimedia clock policy derives it from the rates it has to keep alive,
+ * and the regulator ops below never let a consumer vote take the rail
+ * under it.
+ */
+struct dvfsrc_vreg_floor {
+	unsigned int sel;
+};
+
 #define MTK_DVFSRC_VREG(match, _name, _volt_table)	\
 {							\
 	.name = match,					\
@@ -68,6 +78,7 @@ static int dvfsrc_get_cmd(int rdev_id, enum mtk_dvfsrc_cmd *cmd)
 static int dvfsrc_set_voltage_sel(struct regulator_dev *rdev,
 				  unsigned int selector)
 {
+	const struct dvfsrc_vreg_floor *floor = rdev_get_drvdata(rdev);
 	struct device *dvfsrc_dev = to_dvfsrc_dev(rdev);
 	enum mtk_dvfsrc_cmd req_cmd;
 	int id = rdev_get_id(rdev);
@@ -76,6 +87,18 @@ static int dvfsrc_set_voltage_sel(struct regulator_dev *rdev,
 	ret = dvfsrc_get_cmd(id, &req_cmd);
 	if (ret)
 		return ret;
+
+	/*
+	 * The rail may still be carrying clocks this driver does not manage,
+	 * so a lower vote cannot be honoured: it would ask the collector to
+	 * supply a rate that nothing has moved out of the way.
+	 */
+	if (floor && id == DVFSRC_ID_VCORE && selector < floor->sel) {
+		dev_dbg(rdev_get_dev(rdev),
+			"raising selector %u to the %u floor\n",
+			selector, floor->sel);
+		selector = floor->sel;
+	}
 
 	return mtk_dvfsrc_send_request(dvfsrc_dev, req_cmd, selector);
 }
@@ -299,7 +322,43 @@ static void mt6895_mm_disable_clock(void *data)
 	clk_disable_unprepare(data);
 }
 
-static int mt6895_mm_init(struct device *dev, struct mt6895_mm **result)
+/*
+ * Lowest policy step whose parent rate still covers every multimedia mux at
+ * the rate the bootloader left it at.  When the clock policy is not taken
+ * over, these retained clocks are the only evidence of what the rail has to
+ * support, so this is the step the voltage-only provider must not go under.
+ */
+static unsigned int mt6895_mm_boot_floor(struct mt6895_mm *mm)
+{
+	unsigned int floor = 0;
+	unsigned int i, step;
+	bool found = false;
+
+	for (i = 0; i < ARRAY_SIZE(mm->mux); i++) {
+		unsigned long rate;
+
+		if (IS_ERR_OR_NULL(mm->mux[i]))
+			continue;
+
+		rate = clk_get_rate(mm->mux[i]);
+		for (step = 0; step < MTK_MM_STEPS; step++) {
+			if (mt6895_source_rates[mt6895_parents[i][step]] >= rate)
+				break;
+		}
+		/* Already faster than any step the policy can express. */
+		if (step == MTK_MM_STEPS)
+			step = MTK_MM_STEPS - 1;
+
+		floor = max(floor, step);
+		found = true;
+	}
+
+	/* Nothing could be inspected: the top step is the only provable one. */
+	return found ? floor : MTK_MM_STEPS - 1;
+}
+
+static int mt6895_mm_init(struct device *dev, struct mt6895_mm **result,
+			  unsigned int *floor_sel)
 {
 	struct mt6895_mm *mm;
 	unsigned long rate, expected;
@@ -311,14 +370,25 @@ static int mt6895_mm_init(struct device *dev, struct mt6895_mm **result)
 	mm->dev = dev;
 	mutex_init(&mm->lock);
 
+	/*
+	 * A handover that does not go through leaves this driver serving
+	 * voltage only, so everything taken here has to be given back: keeping
+	 * the exclusive rate claims of a policy that is not running would keep
+	 * limiting every other frequency consumer of these clocks.
+	 */
+	if (!devres_open_group(dev, mt6895_mm_init, GFP_KERNEL))
+		return -ENOMEM;
+
 	/* Freeze the policy's sources as well as its muxes against other writers. */
 	for (i = 0; i < MM_SOURCE_COUNT; i++) {
 		mm->source[i] = devm_clk_get(dev, mt6895_source_names[i]);
-		if (IS_ERR(mm->source[i]))
-			return PTR_ERR(mm->source[i]);
+		if (IS_ERR(mm->source[i])) {
+			ret = PTR_ERR(mm->source[i]);
+			goto err;
+		}
 		ret = devm_clk_rate_exclusive_get(dev, mm->source[i]);
 		if (ret)
-			return ret;
+			goto err;
 		rate = clk_get_rate(mm->source[i]);
 		expected = mt6895_source_rates[i];
 		/* Allow integer PLL rounding, not a different firmware PLL policy. */
@@ -326,16 +396,19 @@ static int mt6895_mm_init(struct device *dev, struct mt6895_mm **result)
 			dev_warn(dev,
 				 "unexpected %s rate %lu (expected %lu), voltage only\n",
 				 mt6895_source_names[i], rate, expected);
-			return -EOPNOTSUPP;
+			ret = -EOPNOTSUPP;
+			goto err;
 		}
 	}
 	for (i = 0; i < ARRAY_SIZE(mm->mux); i++) {
 		mm->mux[i] = devm_clk_get(dev, mt6895_mux_names[i]);
-		if (IS_ERR(mm->mux[i]))
-			return PTR_ERR(mm->mux[i]);
+		if (IS_ERR(mm->mux[i])) {
+			ret = PTR_ERR(mm->mux[i]);
+			goto err;
+		}
 		ret = devm_clk_rate_exclusive_get(dev, mm->mux[i]);
 		if (ret)
-			return ret;
+			goto err;
 		for (j = 0; j < MTK_MM_STEPS; j++) {
 			if (clk_has_parent(mm->mux[i],
 					   mm->source[mt6895_parents[i][j]]))
@@ -343,14 +416,16 @@ static int mt6895_mm_init(struct device *dev, struct mt6895_mm **result)
 			dev_warn(dev, "%s cannot take %s, voltage only\n",
 				 mt6895_mux_names[i],
 				 mt6895_source_names[mt6895_parents[i][j]]);
-			return -EOPNOTSUPP;
+			ret = -EOPNOTSUPP;
+			goto err;
 		}
 		rate = clk_get_rate(mm->mux[i]);
 		expected = mt6895_source_rates[mt6895_parents[i][MTK_MM_STEPS - 1]];
 		if (!rate || rate > expected + 1000) {
 			dev_warn(dev, "unsupported boot %s rate %lu, voltage only\n",
 				 mt6895_mux_names[i], rate);
-			return -EOPNOTSUPP;
+			ret = -EOPNOTSUPP;
+			goto err;
 		}
 	}
 
@@ -370,26 +445,35 @@ static int mt6895_mm_init(struct device *dev, struct mt6895_mm **result)
 	for (i = 0; i < ARRAY_SIZE(mm->mux); i++) {
 		ret = clk_prepare_enable(mm->mux[i]);
 		if (ret)
-			return ret;
+			goto err;
 		ret = devm_add_action_or_reset(dev, mt6895_mm_disable_clock,
 					       mm->mux[i]);
 		if (ret)
-			return ret;
+			goto err;
 	}
 	/* Align every mux with the step the rail was just asked for. */
 	for (i = 0; i < ARRAY_SIZE(mm->mux); i++) {
 		ret = mt6895_mm_parent(mm, i, MTK_MM_STEPS - 1);
-		if (ret)
-			return dev_err_probe(dev, ret,
-					     "cannot program %s for the handover step\n",
-					     mt6895_mux_names[i]);
+		if (ret) {
+			dev_err_probe(dev, ret,
+				      "cannot program %s for the handover step\n",
+				      mt6895_mux_names[i]);
+			goto err;
+		}
 	}
 	mm->state.step = MTK_MM_STEPS - 1;
 	ret = devm_add_action_or_reset(dev, mt6895_mm_release, mm);
 	if (ret)
-		return ret;
+		goto err;
+
+	devres_close_group(dev, mt6895_mm_init);
 	*result = mm;
 	return 0;
+
+err:
+	*floor_sel = mt6895_mm_boot_floor(mm);
+	devres_release_group(dev, mt6895_mm_init);
+	return ret;
 }
 
 static const unsigned int mt6895_voltages[] = {
@@ -442,12 +526,29 @@ static int dvfsrc_vcore_regulator_probe(struct platform_device *pdev)
 
 	descs = pdata->descs;
 	if (pdata == &mt6895_data) {
-		ret = mt6895_mm_init(&pdev->dev, &mm);
+		struct dvfsrc_vreg_floor *floor;
+		unsigned int floor_sel = MTK_MM_STEPS - 1;
+
+		ret = mt6895_mm_init(&pdev->dev, &mm, &floor_sel);
 		if (ret == -EOPNOTSUPP) {
+			/*
+			 * The boot clocks stay where the bootloader left them and
+			 * are carried by the rail as it is.  Nothing has proved
+			 * that a lower step covers them, so hold the floor that
+			 * was derived from their rates.
+			 */
 			dev_warn(&pdev->dev,
-				 "multimedia clock handover unavailable, voltage only\n");
+				 "multimedia clock handover unavailable, voltage only, VCORE floor at step %u\n",
+				 floor_sel);
 			mm = NULL;
 			descs = mt6895_regulators_plain;
+
+			floor = devm_kzalloc(&pdev->dev, sizeof(*floor),
+					     GFP_KERNEL);
+			if (!floor)
+				return -ENOMEM;
+			floor->sel = floor_sel;
+			config.driver_data = floor;
 		} else if (ret) {
 			return dev_err_probe(&pdev->dev, ret,
 					     "failed multimedia clock handover\n");
