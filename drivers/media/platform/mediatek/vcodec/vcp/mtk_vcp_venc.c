@@ -504,6 +504,44 @@ u64 mtk_vcp_venc_cookie(struct mtk_vcp_venc_inst *inst)
 }
 EXPORT_SYMBOL_GPL(mtk_vcp_venc_cookie);
 
+/* One-shot bring-up probe: ask the firmware which video formats and frame
+ * sizes it accepts, so the driver's static tables can be checked against the
+ * firmware instead of against the vendor header.
+ */
+static void mtk_vcp_venc_dump_caps(struct mtk_vcp_venc_inst *inst)
+{
+	struct vcp_venc_video_format *formats;
+	struct vcp_venc_frame_sizes *sizes;
+	int ret, i;
+
+	formats = kzalloc(sizeof(*formats) * VCP_VENC_MAX_CAPS, GFP_KERNEL);
+	sizes = kzalloc(sizeof(*sizes) * VCP_VENC_MAX_CAPS, GFP_KERNEL);
+	if (!formats || !sizes)
+		goto out;
+	ret = mtk_vcp_venc_query_caps(inst, formats, sizes);
+	if (ret) {
+		dev_warn(inst->enc->dev, "VENC caps query failed: %d\n", ret);
+		goto out;
+	}
+	for (i = 0; i < VCP_VENC_MAX_CAPS && formats[i].fourcc; i++)
+		dev_info(inst->enc->dev,
+			 "VENC cap fmt[%d]: fourcc=%#x type=%u planes=%u\n", i,
+			 le32_to_cpu(formats[i].fourcc), le32_to_cpu(formats[i].type),
+			 le32_to_cpu(formats[i].num_planes));
+	for (i = 0; i < VCP_VENC_MAX_CAPS && sizes[i].fourcc; i++)
+		dev_info(inst->enc->dev,
+			 "VENC cap size[%d]: fourcc=%#x profile=%u level=%u %ux%u..%ux%u\n",
+			 i, le32_to_cpu(sizes[i].fourcc), le32_to_cpu(sizes[i].profile),
+			 le32_to_cpu(sizes[i].level),
+			 le32_to_cpu(sizes[i].stepwise.min_width),
+			 le32_to_cpu(sizes[i].stepwise.min_height),
+			 le32_to_cpu(sizes[i].stepwise.max_width),
+			 le32_to_cpu(sizes[i].stepwise.max_height));
+out:
+	kfree(formats);
+	kfree(sizes);
+}
+
 int mtk_vcp_venc_init(struct mtk_vcp_venc_inst *inst)
 {
 	struct vcp_venc_init_msg msg = {
@@ -547,6 +585,8 @@ bad_ack:
 	mutex_unlock(&inst->enc->rx_lock);
 out:
 	mutex_unlock(&inst->enc->api_lock);
+	if (!ret)
+		mtk_vcp_venc_dump_caps(inst);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mtk_vcp_venc_init);
