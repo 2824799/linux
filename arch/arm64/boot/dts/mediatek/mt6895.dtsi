@@ -446,6 +446,121 @@
 	 * The clock is now the real topckgen MFG_SEL_0 output, so devfreq can
 	 * set the MFGPLL and mux to these rates.
 	 */
+	/*
+	 * Multimedia OPP tables. The frequencies are the topckgen mux
+	 * parents that the vendor mmdvfs driver selects per voltage
+	 * step; the voltages are the VCORE steps of the DVFSRC
+	 * regulator. Requests are aggregated, so a client may keep a
+	 * low OPP while another one holds the rail high.
+	 */
+	opp_table_venc: opp-table-venc {
+		compatible = "operating-points-v2";
+
+		opp-249600000 {
+			opp-hz = /bits/ 64 <249600000>;
+			opp-microvolt = <575000>;
+		};
+		opp-312000000 {
+			opp-hz = /bits/ 64 <312000000>;
+			opp-microvolt = <600000>;
+		};
+		opp-458333313 {
+			opp-hz = /bits/ 64 <458333313>;
+			opp-microvolt = <650000>;
+		};
+		opp-624000000 {
+			opp-hz = /bits/ 64 <624000000>;
+			opp-microvolt = <725000>;
+		};
+	};
+
+	opp_table_vdec: opp-table-vdec {
+		compatible = "operating-points-v2";
+
+		opp-218400000 {
+			opp-hz = /bits/ 64 <218400000>;
+			opp-microvolt = <575000>;
+		};
+		opp-249600000 {
+			opp-hz = /bits/ 64 <249600000>;
+			opp-microvolt = <600000>;
+		};
+		opp-416000000 {
+			opp-hz = /bits/ 64 <416000000>;
+			opp-microvolt = <650000>;
+		};
+		opp-594000000 {
+			opp-hz = /bits/ 64 <594000000>;
+			opp-microvolt = <725000>;
+		};
+		opp-660000000 {
+			opp-hz = /bits/ 64 <660000000>;
+			opp-microvolt = <750000>;
+		};
+	};
+
+	opp_table_disp0: opp-table-disp0 {
+		compatible = "operating-points-v2";
+
+		opp-208000000 {
+			opp-hz = /bits/ 64 <208000000>;
+			opp-microvolt = <575000>;
+		};
+		opp-249600000 {
+			opp-hz = /bits/ 64 <249600000>;
+			opp-microvolt = <600000>;
+		};
+		opp-436800000 {
+			opp-hz = /bits/ 64 <436800000>;
+			opp-microvolt = <650000>;
+		};
+		opp-624000000 {
+			opp-hz = /bits/ 64 <624000000>;
+			opp-microvolt = <725000>;
+		};
+	};
+
+	opp_table_mminfra: opp-table-mminfra {
+		compatible = "operating-points-v2";
+
+		opp-218400000 {
+			opp-hz = /bits/ 64 <218400000>;
+			opp-microvolt = <575000>;
+		};
+		opp-273000000 {
+			opp-hz = /bits/ 64 <273000000>;
+			opp-microvolt = <600000>;
+		};
+		opp-436800000 {
+			opp-hz = /bits/ 64 <436800000>;
+			opp-microvolt = <650000>;
+		};
+		opp-624000000 {
+			opp-hz = /bits/ 64 <624000000>;
+			opp-microvolt = <725000>;
+		};
+		opp-687499969 {
+			opp-hz = /bits/ 64 <687499969>;
+			opp-microvolt = <750000>;
+		};
+	};
+
+	vcp_vdec_dma: vcp-vdec-dma {
+		compatible = "mediatek,mt6895-vcp-vdec-dma";
+		iommus = <&mdp_iommu 0x50420>;
+	};
+
+	vdec_ube_dma: vdec-ube-dma {
+		compatible = "mediatek,mt6895-vdec-ube-dma";
+		iommus = <&disp_iommu 0x100a5>;
+	};
+
+	vcp_venc_dma: vcp-venc-dma {
+		compatible = "mediatek,mt6895-vcp-venc-dma";
+		/* table0, video domain6, pseudo-larb33, port1 */
+		iommus = <&mdp_iommu 0x60421>;
+	};
+
 	gpu_opp_table: opp-table-gpu {
 		compatible = "operating-points-v2";
 		opp-950000000 {
@@ -641,7 +756,6 @@
 
 		#address-cells = <1>;
 		#size-cells = <1>;
-
 
 		gic: interrupt-controller@c000000 {
 			compatible = "arm,gic-v3";
@@ -1961,7 +2075,6 @@
 			};
 		};
 
-
 /* AUDIO_TOP_CONx gate clock provider consumed by the AFE */
 afe_clks: syscon@1e100000 {
 compatible = "mediatek,mt6895-afe", "syscon";
@@ -2095,8 +2208,6 @@ prefer_mode = <0>;
 mode_size = <0x12000 0x18000>;
 block_size = <0x1000>;
 };
-
-
 
 		gpueb: gpueb@13c40000 {
 			compatible = "mediatek,gpueb";
@@ -2364,105 +2475,6 @@ block_size = <0x1000>;
 					regulator-min-microvolt = <575000>;
 					regulator-max-microvolt = <750000>;
 				};
-			};
-		};
-
-		/*
-		 * Multimedia OPP tables. The frequencies are the topckgen mux
-		 * parents that the vendor mmdvfs driver selects per voltage
-		 * step; the voltages are the VCORE steps of the DVFSRC
-		 * regulator. Requests are aggregated, so a client may keep a
-		 * low OPP while another one holds the rail high.
-		 */
-		opp_table_venc: opp-table-venc {
-			compatible = "operating-points-v2";
-
-			opp-249600000 {
-				opp-hz = /bits/ 64 <249600000>;
-				opp-microvolt = <575000>;
-			};
-			opp-312000000 {
-				opp-hz = /bits/ 64 <312000000>;
-				opp-microvolt = <600000>;
-			};
-			opp-458333313 {
-				opp-hz = /bits/ 64 <458333313>;
-				opp-microvolt = <650000>;
-			};
-			opp-624000000 {
-				opp-hz = /bits/ 64 <624000000>;
-				opp-microvolt = <725000>;
-			};
-		};
-
-		opp_table_vdec: opp-table-vdec {
-			compatible = "operating-points-v2";
-
-			opp-218400000 {
-				opp-hz = /bits/ 64 <218400000>;
-				opp-microvolt = <575000>;
-			};
-			opp-249600000 {
-				opp-hz = /bits/ 64 <249600000>;
-				opp-microvolt = <600000>;
-			};
-			opp-416000000 {
-				opp-hz = /bits/ 64 <416000000>;
-				opp-microvolt = <650000>;
-			};
-			opp-594000000 {
-				opp-hz = /bits/ 64 <594000000>;
-				opp-microvolt = <725000>;
-			};
-			opp-660000000 {
-				opp-hz = /bits/ 64 <660000000>;
-				opp-microvolt = <750000>;
-			};
-		};
-
-		opp_table_disp0: opp-table-disp0 {
-			compatible = "operating-points-v2";
-
-			opp-208000000 {
-				opp-hz = /bits/ 64 <208000000>;
-				opp-microvolt = <575000>;
-			};
-			opp-249600000 {
-				opp-hz = /bits/ 64 <249600000>;
-				opp-microvolt = <600000>;
-			};
-			opp-436800000 {
-				opp-hz = /bits/ 64 <436800000>;
-				opp-microvolt = <650000>;
-			};
-			opp-624000000 {
-				opp-hz = /bits/ 64 <624000000>;
-				opp-microvolt = <725000>;
-			};
-		};
-
-		opp_table_mminfra: opp-table-mminfra {
-			compatible = "operating-points-v2";
-
-			opp-218400000 {
-				opp-hz = /bits/ 64 <218400000>;
-				opp-microvolt = <575000>;
-			};
-			opp-273000000 {
-				opp-hz = /bits/ 64 <273000000>;
-				opp-microvolt = <600000>;
-			};
-			opp-436800000 {
-				opp-hz = /bits/ 64 <436800000>;
-				opp-microvolt = <650000>;
-			};
-			opp-624000000 {
-				opp-hz = /bits/ 64 <624000000>;
-				opp-microvolt = <725000>;
-			};
-			opp-687499969 {
-				opp-hz = /bits/ 64 <687499969>;
-				opp-microvolt = <750000>;
 			};
 		};
 
@@ -2759,8 +2771,6 @@ block_size = <0x1000>;
 			clocks = <&mmsys1 CLK_MM1_SMI_COMMON>, <&mmsys1 CLK_MM1_SMI_COMMON>;
 			clock-names = "apb", "smi";
 		};
-
-
 
 		mdp_iommu_bank1: iommu@1e811000 {
 			compatible = "mediatek,common-mdp-iommu-bank1";
@@ -3501,7 +3511,6 @@ block_size = <0x1000>;
 			hw-voter-regmap = <&hwv>;
 		};
 
-
 		mipi_tx0: mipi_tx_config@11f70000 {
 			compatible = "mediatek,mt6895-mipi-tx";
 			reg = <0x11f70000 0x1000>;
@@ -3520,16 +3529,6 @@ block_size = <0x1000>;
 			interrupts = <GIC_SPI 618 IRQ_TYPE_LEVEL_HIGH 0>;
 			/* Firmware/backend and resource bindings are incomplete. */
 			status = "disabled";
-		};
-
-		vcp_vdec_dma: vcp-vdec-dma {
-			compatible = "mediatek,mt6895-vcp-vdec-dma";
-			iommus = <&mdp_iommu 0x50420>;
-		};
-
-		vdec_ube_dma: vdec-ube-dma {
-			compatible = "mediatek,mt6895-vdec-ube-dma";
-			iommus = <&disp_iommu 0x100a5>;
 		};
 
 		vcodec_dec: video-codec@16000000 {
@@ -3559,12 +3558,6 @@ block_size = <0x1000>;
 				 <&mdp_iommu 0x84>, <&mdp_iommu 0x85>,
 				 <&mdp_iommu 0x86>, <&mdp_iommu 0x88>,
 				 <&mdp_iommu 0x89>, <&mdp_iommu 0x8a>;
-		};
-
-		vcp_venc_dma: vcp-venc-dma {
-			compatible = "mediatek,mt6895-vcp-venc-dma";
-			/* table0, video domain6, pseudo-larb33, port1 */
-			iommus = <&mdp_iommu 0x60421>;
 		};
 
 		vcp: vcp@1ea00000 {
