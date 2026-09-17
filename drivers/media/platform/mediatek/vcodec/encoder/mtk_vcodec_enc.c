@@ -28,7 +28,22 @@
 
 #define DFT_CFG_WIDTH	MTK_VENC_MIN_W
 #define DFT_CFG_HEIGHT	MTK_VENC_MIN_H
-#define MTK_MAX_CTRLS_HINT	20
+#define MTK_MAX_CTRLS_HINT	21
+
+/* Vendor-private color description transport, in
+ * MiCode/Xiaomi_Kernel_OpenSource xaga-s-oss
+ * drivers/media/platform/mtk-vcodec/mtk_vcodec_drv.h:
+ * V4L2_CID_MPEG_MTK_BASE is (MPEG_CTRL_CLASS | 0x2000) and
+ * V4L2_CID_MPEG_MTK_COLOR_DESC is BASE+7. This tree renamed the MPEG
+ * class to V4L2_CTRL_CLASS_CODEC with the same 0x00990000 value, so
+ * (V4L2_CTRL_CLASS_CODEC | 0x2007) is numerically identical to the
+ * vendor ID. A U32 array of 17 words in struct mtk_color_desc order: primaries, transfer, matrix,
+ * display_primaries_x[3], display_primaries_y[3], white_point_x/y,
+ * max/min_display_mastering_luminance, max_content_light_level,
+ * max_pic_light_level, is_hdr, full_range.
+ */
+#define V4L2_CID_MPEG_MTK_COLOR_DESC	(V4L2_CTRL_CLASS_CODEC | 0x2007)
+#define MTK_COLOR_DESC_WORDS	17
 
 #define MTK_DEFAULT_FRAMERATE_NUM 1001
 #define MTK_DEFAULT_FRAMERATE_DENOM 30000
@@ -146,6 +161,25 @@ static int vidioc_venc_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP:
 		p->hevc_max_qp = ctrl->val;
 		break;
+	case V4L2_CID_MPEG_MTK_COLOR_DESC: {
+		const u32 *desc = ctrl->p_new.p_u32;
+		unsigned int i;
+
+		/* Static like the other firmware-config controls: the
+		 * streaming guard above already refuses this after STREAMON.
+		 */
+		if (ctrl->elems != MTK_COLOR_DESC_WORDS)
+			return -EINVAL;
+		/* H.273 VUI identifiers fit in one byte each. */
+		for (i = 0; i < 3; i++)
+			if (desc[i] > 255)
+				return -EINVAL;
+		if (desc[15] > 1 || desc[16] > 1)
+			return -EINVAL;
+		memcpy(p->color_desc, desc, sizeof(p->color_desc));
+		p->color_desc_set = true;
+		break;
+	}
 	case V4L2_CID_MPEG_VIDEO_H264_I_PERIOD:
 		mtk_v4l2_venc_dbg(2, ctx, "V4L2_CID_MPEG_VIDEO_H264_I_PERIOD val = %d", ctrl->val);
 		p->intra_period = ctrl->val;
@@ -487,7 +521,14 @@ static void mtk_venc_set_param(struct mtk_vcodec_enc_ctx *ctx,
 		param->input_yuv_fmt = VENC_YUV_FORMAT_P010;
 		break;
 	default:
+		/* Unreachable: S_FMT/TRY_FMT substitute any non-table fourcc
+		 * (RGB, 4:2:2/4:4:4, MT10 tile, compressed MT21*) with the
+		 * default output format, so q_data->fmt is always one of the
+		 * cases above. Fail closed if that ever changes: VCP firmware
+		 * has no mapping for those layouts.
+		 */
 		mtk_v4l2_venc_err(ctx, "Unsupported fourcc =%d", q_data_src->fmt->fourcc);
+		param->input_yuv_fmt = 0;
 		break;
 	}
 	param->h264_profile = enc_params->h264_profile;
@@ -1606,6 +1647,27 @@ int mtk_vcodec_enc_ctrls_setup(struct mtk_vcodec_enc_ctx *ctx)
 			V4L2_MPEG_VIDEO_HEVC_TIER_HIGH, 0, V4L2_MPEG_VIDEO_HEVC_TIER_MAIN);
 		v4l2_ctrl_new_std(handler, ops, V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP,
 			0, 51, 1, 51);
+	}
+	if (vcp) {
+		struct v4l2_ctrl_config color_desc_cfg = {
+			.ops = ops,
+			.id = V4L2_CID_MPEG_MTK_COLOR_DESC,
+			.name = "Video encode color description for HDR",
+			.type = V4L2_CTRL_TYPE_U32,
+			/* Deliberately readable, unlike the vendor flag: the
+			 * payload is session state the client itself wrote
+			 * (or zeros), so reading leaks nothing, while
+			 * WRITE_ONLY makes v4l2-compliance fail: the core
+			 * reports ENOSPC for a zero-size read before it
+			 * reaches the write-only check that demands EACCES.
+			 */
+			.min = 0x00000000,
+			.max = 0xffffffff,
+			.step = 1,
+			.dims = { MTK_COLOR_DESC_WORDS },
+		};
+
+		v4l2_ctrl_new_custom(handler, &color_desc_cfg, NULL);
 	}
 	if (!vcp)
 		v4l2_ctrl_new_std_menu(handler, ops, V4L2_CID_MPEG_VIDEO_VP8_PROFILE,

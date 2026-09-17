@@ -242,6 +242,48 @@ static int vcp_hevc_level(unsigned int level, unsigned int tier)
 	return main_tier[level] + tier;
 }
 
+/* Wire indices into the 17-word vendor color description. Only the three
+ * VUI bytes and full_range are meaningful for SDR; the mastering, light
+ * level and is_hdr words require 10-bit samples.
+ */
+enum vcp_color_desc_index {
+	VCP_COLOR_PRIMARIES = 0,
+	VCP_COLOR_TRANSFER = 1,
+	VCP_COLOR_MATRIX = 2,
+	VCP_COLOR_MAX_LUMINANCE = 11,
+	VCP_COLOR_MIN_LUMINANCE = 12,
+	VCP_COLOR_MAX_CLL = 13,
+	VCP_COLOR_MAX_FALL = 14,
+	VCP_COLOR_IS_HDR = 15,
+	VCP_COLOR_FULL_RANGE = 16,
+};
+
+static int vcp_encoder_fill_color(const struct mtk_vcodec_enc_ctx *ctx,
+				  bool ten_bit, __le32 out[17])
+{
+	const u32 *desc = ctx->enc_params.color_desc;
+	unsigned int i;
+
+	if (!ctx->enc_params.color_desc_set)
+		return 0;
+	/* The frontend validates the same bounds; re-check here so a future
+	 * writer cannot push out-of-range VUI bytes onto the wire.
+	 */
+	if (desc[VCP_COLOR_PRIMARIES] > 255 ||
+	    desc[VCP_COLOR_TRANSFER] > 255 ||
+	    desc[VCP_COLOR_MATRIX] > 255 ||
+	    desc[VCP_COLOR_IS_HDR] > 1 || desc[VCP_COLOR_FULL_RANGE] > 1)
+		return -EINVAL;
+	if (!ten_bit && (desc[VCP_COLOR_IS_HDR] ||
+			 desc[VCP_COLOR_MAX_LUMINANCE] ||
+			 desc[VCP_COLOR_MIN_LUMINANCE] ||
+			 desc[VCP_COLOR_MAX_CLL] || desc[VCP_COLOR_MAX_FALL]))
+		return -EINVAL;
+	for (i = 0; i < 17; i++)
+		out[i] = cpu_to_le32(desc[i]);
+	return 0;
+}
+
 static int vcp_encoder_set_param(void *handle, enum venc_set_param_type type,
 				      struct venc_enc_param *p)
 {
@@ -253,6 +295,7 @@ static int vcp_encoder_set_param(void *handle, enum venc_set_param_type type,
 	bool synchronous;
 	struct mtk_q_data *q;
 	unsigned int i;
+	bool ten_bit;
 	int ret, cleanup;
 
 	if (!h || h->failed || !h->inst)
@@ -328,23 +371,30 @@ static int vcp_encoder_set_param(void *handle, enum venc_set_param_type type,
 	config.level = cpu_to_le32(p->h264_level);
 	config.num_b_frame = cpu_to_le32(0);
 	config.max_qp = cpu_to_le32(h->ctx->enc_params.h264_max_qp);
+	/* P010 is the only 10-bit input with a V4L2 mapping; MT10 tile mode
+	 * has no userspace layout, so it is never advertised or accepted.
+	 */
+	ten_bit = (p->input_yuv_fmt == VENC_YUV_FORMAT_P010);
 	if (h->ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_HEVC) {
 		const struct mtk_enc_params *params = &h->ctx->enc_params;
-		bool ten_bit = params->hevc_profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10;
+		bool main10 = params->hevc_profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10;
 
 		/* Profile and level are firmware values, not V4L2 enum ordinals. */
-		if ((!ten_bit && params->hevc_profile != V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN) ||
+		if ((!main10 && params->hevc_profile != V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN) ||
 		    params->hevc_level > V4L2_MPEG_VIDEO_HEVC_LEVEL_6_2 ||
 		    params->hevc_tier > V4L2_MPEG_VIDEO_HEVC_TIER_HIGH ||
-		    ten_bit != (p->input_yuv_fmt == VENC_YUV_FORMAT_P010))
+		    main10 != ten_bit)
 			return -EINVAL;
 		ret = vcp_hevc_level(params->hevc_level, params->hevc_tier);
 		if (ret < 0)
 			return ret;
-		config.profile = cpu_to_le32(ten_bit ? 4 : 2);
+		config.profile = cpu_to_le32(main10 ? 4 : 2);
 		config.level = cpu_to_le32(ret);
 		config.max_qp = cpu_to_le32(params->hevc_max_qp);
 	}
+	ret = vcp_encoder_fill_color(h->ctx, ten_bit, config.color_desc);
+	if (ret)
+		return ret;
 	h->configured = false;
 	ret = mtk_vcp_venc_configure(h->inst, &config, sizes, &synchronous);
 	if (ret)

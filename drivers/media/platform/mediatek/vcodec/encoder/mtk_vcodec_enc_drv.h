@@ -78,6 +78,8 @@ enum mtk_encode_param {
  * @hevc_level: V4L2 HEVC level
  * @hevc_tier: V4L2 HEVC tier
  * @hevc_max_qp: Maximum HEVC quantization parameter
+ * @color_desc: validated MTK color description, 17 u32 in vendor wire order
+ * @color_desc_set: whether userspace supplied @color_desc for this session
  * @force_intra: force/insert intra frame
  */
 struct mtk_enc_params {
@@ -94,6 +96,8 @@ struct mtk_enc_params {
 	unsigned int	h264_profile;
 	unsigned int	h264_level;
 	unsigned int	hevc_profile, hevc_level, hevc_tier, hevc_max_qp;
+	u32		color_desc[17];
+	bool		color_desc_set;
 	unsigned int	force_intra;
 };
 
