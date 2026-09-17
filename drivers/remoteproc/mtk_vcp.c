@@ -646,6 +646,10 @@ int mtk_vcp_boot(struct mtk_vcp *vcp)
 {
 	int ret;
 
+	/* Resolve a queued watchdog report before rproc_boot decides whether
+	 * an existing boot reference represents a usable processor.
+	 */
+	flush_work(&vcp->rproc->crash_handler);
 	VCPDBG("boot: state=%d, requesting\n", vcp->rproc->state);
 	ret = rproc_boot(vcp->rproc);
 	VCPDBG("boot: -> %d, state=%d powered=%d\n", ret, vcp->rproc->state,

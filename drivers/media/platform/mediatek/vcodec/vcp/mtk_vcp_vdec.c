@@ -27,7 +27,9 @@ struct dec_memory {
 struct dec_surface {
 	u64 cookie;
 	dma_addr_t y, c;
-	bool displayed;
+	/* Pending surfaces are AP-owned until a synchronous START selects one. */
+	bool displayed, pending;
+	u32 index;
 };
 
 struct mtk_vcp_vdec {
@@ -41,7 +43,7 @@ struct mtk_vcp_vdec {
 	u64 cookie, next_memory;
 	u32 address, expected, codec_id;
 	int error;
-	bool initialized, broken, firmware_live;
+	bool initialized, broken, firmware_live, picture_known;
 	unsigned long cores;
 	u8 response[64] __aligned(8);
 	size_t response_size, work_bytes;
@@ -60,6 +62,9 @@ static atomic64_t session_cookie = ATOMIC64_INIT(0);
 
 static void dec_fail(struct mtk_vcp_vdec *d, int error)
 {
+	/* Keep the first failure even if an ACK or another error arrives late. */
+	if (d->broken)
+		return;
 	VCPDBG("failure: %d (kept %d), initialized=%d firmware_live=%d cores=%#lx\n",
 	       error, error ?: -EIO, d->initialized, d->firmware_live,
 	       d->cores);
@@ -158,7 +163,7 @@ static int dec_push_event(struct mtk_vcp_vdec *d, enum vcp_vdec_event_type type,
 	return 0;
 }
 
-/* Firmware pauses at PUT_FRAME_BUFFER until the AP has consumed the rings. */
+/* Consume at PUT_FRAME_BUFFER, or after START/RESET for synchronous codecs. */
 static int dec_frames(struct mtk_vcp_vdec *d, struct vcp_vdec_fb_ring *r, bool display)
 {
 	u32 read = le32_to_cpu(READ_ONCE(r->read));
@@ -183,7 +188,7 @@ static int dec_frames(struct mtk_vcp_vdec *d, struct vcp_vdec_fb_ring *r, bool d
 		 * fields in display/free entries. Never interpret a cookie as
 		 * a pointer; any supplied address must match our submitted record.
 		 */
-		if (!s || (f->y && s->y != le64_to_cpu(f->y)) ||
+		if (!s || s->pending || (f->y && s->y != le64_to_cpu(f->y)) ||
 		    (f->c && s->c != le64_to_cpu(f->c)) ||
 		    (display && s->displayed))
 			return -EPROTO;
@@ -278,7 +283,8 @@ static void dec_receive(void *priv, const void *data, size_t size)
 		}
 		memcpy(d->response, buf, size);
 		d->response_size = size;
-		d->error = (s32)le32_to_cpu(a->status);
+		if (!d->broken)
+			d->error = (s32)le32_to_cpu(a->status);
 		complete(&d->reply);
 		goto out;
 	}
@@ -578,7 +584,8 @@ int mtk_vcp_vdec_picture(struct mtk_vcp_vdec *d, struct vcp_vdec_picture *p)
 	    p->stride < p->width || p->stride > 4096 || (p->stride & 15) ||
 	    p->buffer_height < p->height || p->buffer_height > 2176 ||
 	    (p->buffer_height & 31) || !p->dpb || p->dpb > 32 ||
-	    p->fourcc != V4L2_PIX_FMT_MM21 || p->input_driven != 2 ||
+	    p->fourcc != V4L2_PIX_FMT_MM21 ||
+	    (p->input_driven != 0 && p->input_driven != 2) ||
 	    le32_to_cpu(v->pic.bitdepth) != 8 ||
 	    p->size[0] != p->stride * p->buffer_height ||
 	    p->size[1] != p->size[0] / 2) {
@@ -590,6 +597,8 @@ int mtk_vcp_vdec_picture(struct mtk_vcp_vdec *d, struct vcp_vdec_picture *p)
 			p->input_driven);
 		ret = -EOPNOTSUPP;
 	}
+	if (!ret)
+		d->picture_known = true;
 out:
 	mutex_unlock(&d->api_lock);
 	return ret;
@@ -627,8 +636,16 @@ int mtk_vcp_vdec_frame(struct mtk_vcp_vdec *d, u64 cookie, unsigned int index,
 	ret = -ENOSPC;
 	if (slot == 64)
 		goto unlock;
-	d->surfaces[slot] = (struct dec_surface){ .cookie = cookie, .y = y, .c = c };
+	d->surfaces[slot] = (struct dec_surface){
+		.cookie = cookie, .y = y, .c = c, .index = index,
+		.pending = !d->vsi->input_driven,
+	};
 	mutex_unlock(&d->rx_lock);
+	if (!d->vsi->input_driven) {
+		/* NON_INPUT_DRIVEN supplies one frame in the next START VSI. */
+		ret = 0;
+		goto out;
+	}
 	memcpy(msg.data, &f, sizeof(f));
 	ret = dec_command(d, &msg, sizeof(msg), VCP_VDEC_DONE);
 	goto out;
@@ -649,7 +666,7 @@ int mtk_vcp_vdec_start(struct mtk_vcp_vdec *d, u64 cookie, dma_addr_t dma,
 		.vcp_inst_addr = cpu_to_le32(d->address),
 		.data = { cpu_to_le32(bytes), cpu_to_le32(capacity), 0 },
 	};
-	unsigned int i, slot = 64, frames = 0;
+	unsigned int i, slot = 64, frames = 0, frame_slot = 64;
 	bool parsing_header;
 	int ret = -EINVAL;
 
@@ -668,27 +685,55 @@ int mtk_vcp_vdec_start(struct mtk_vcp_vdec *d, u64 cookie, dma_addr_t dma,
 			slot = i;
 		if (d->surfaces[i].cookie)
 			frames++;
+		if (d->surfaces[i].pending)
+			frame_slot = i;
 	}
 	ret = -ENOSPC;
 	if (slot == 64)
 		goto unlock;
+	parsing_header = !d->picture_known;
+	if (!parsing_header && !d->vsi->input_driven && frame_slot == 64)
+		goto unlock;
 	d->bitstreams[slot] = cookie;
-	parsing_header = !d->vsi->input_driven;
 	d->vsi->dec.bs_dma = cpu_to_le64(dma);
 	d->vsi->dec.bs_cookie = cpu_to_le64(cookie);
 	d->vsi->dec.fb_cookie = 0;
+	d->vsi->dec.index = cpu_to_le32(0xff);
+	memset(d->vsi->dec.fb_dma, 0, sizeof(d->vsi->dec.fb_dma));
+	if (!parsing_header && !d->vsi->input_driven) {
+		struct dec_surface *s = &d->surfaces[frame_slot];
+
+		d->vsi->dec.fb_cookie = cpu_to_le64(s->cookie);
+		d->vsi->dec.index = cpu_to_le32(s->index);
+		d->vsi->dec.fb_dma[0] = cpu_to_le64(s->y);
+		d->vsi->dec.fb_dma[1] = cpu_to_le64(s->c);
+		s->pending = false;
+	}
 	d->vsi->dec.timestamp = cpu_to_le64(timestamp);
 	d->vsi->dec.queued_frames = cpu_to_le32(frames);
 	mutex_unlock(&d->rx_lock);
 	ret = dec_command(d, &msg, sizeof(msg), VCP_VDEC_START_DONE);
 	*changed = le32_to_cpu(d->vsi->dec.changed);
-	if (!ret && parsing_header && (*changed & BIT(0))) {
+	if (!ret && !d->vsi->input_driven) {
+		mutex_lock(&d->rx_lock);
+		ret = dec_collect(d);
+		/* START_DONE releases the synchronous input even if this firmware
+		 * omits it from free_bs. A callback may already have returned it.
+		 */
+		if (!ret && d->bitstreams[slot]) {
+			d->bitstreams[slot] = 0;
+			ret = dec_push_event(d, VCP_VDEC_FREE_BITSTREAM, cookie, 0);
+		}
+		mutex_unlock(&d->rx_lock);
+	} else if (!ret && parsing_header && (*changed & BIT(0))) {
 		/* The initial resolution notification requires resubmitting this
 		 * access unit. Firmware has not queued the bitstream for decoding.
 		 */
 		mutex_lock(&d->rx_lock);
-		d->bitstreams[slot] = 0;
-		ret = dec_push_event(d, VCP_VDEC_FREE_BITSTREAM, cookie, 0);
+		if (d->bitstreams[slot]) {
+			d->bitstreams[slot] = 0;
+			ret = dec_push_event(d, VCP_VDEC_FREE_BITSTREAM, cookie, 0);
+		}
 		mutex_unlock(&d->rx_lock);
 	}
 	goto out;
@@ -728,9 +773,28 @@ int mtk_vcp_vdec_reset(struct mtk_vcp_vdec *d, bool drain)
 	/* Drain returns decoded references but leaves unused resources queued.
 	 * A null FRAME_BUFFER plus RESET flush returns those resources as well.
 	 */
-	ret = drain ? 0 : dec_command(d, &flush, sizeof(flush), VCP_VDEC_DONE);
+	ret = drain || !d->vsi->input_driven ? 0 :
+		dec_command(d, &flush, sizeof(flush), VCP_VDEC_DONE);
 	if (!ret)
 		ret = dec_simple_command(d, VCP_VDEC_AP_RESET, VCP_VDEC_RESET_DONE, drain);
+	if (!ret && !d->vsi->input_driven) {
+		unsigned int i;
+
+		mutex_lock(&d->rx_lock);
+		ret = dec_collect(d);
+		for (i = 0; !ret && !drain && i < 64; i++) {
+			struct dec_surface *s = &d->surfaces[i];
+
+			if (!s->pending)
+				continue;
+			ret = dec_push_event(d, VCP_VDEC_FREE_FRAME, s->cookie, 0);
+			if (!ret)
+				memset(s, 0, sizeof(*s));
+		}
+		mutex_unlock(&d->rx_lock);
+	}
+	if (!ret && !drain)
+		d->picture_known = false;
 out:
 	VCPDBG("reset: drain=%d initialized=%d -> %d\n", drain, d->initialized,
 	       ret);
@@ -772,7 +836,8 @@ int mtk_vcp_vdec_deinit(struct mtk_vcp_vdec *d)
 	if (!d->initialized)
 		goto out;
 	/* Deinitializing with unused frames in service2 crashes xaga firmware. */
-	ret = dec_command(d, &flush, sizeof(flush), VCP_VDEC_DONE);
+	ret = !d->vsi->input_driven ? 0 :
+		dec_command(d, &flush, sizeof(flush), VCP_VDEC_DONE);
 	if (!ret)
 		ret = dec_simple_command(d, VCP_VDEC_AP_RESET, VCP_VDEC_RESET_DONE, 0);
 	if (!ret)

@@ -38,7 +38,7 @@ struct mtk_vcp_venc_inst {
 	struct list_head list, allocations, dma_buffers;
 	struct mtk_vcp_venc *enc;
 	u64 cookie;
-	u32 firmware_instance, expected;
+	u32 firmware_instance, expected, codec_id;
 	struct vcp_venc_vsi *vsi;
 	struct completion reply;
 	u8 response[MTK_VCP_IPI_MAX_PAYLOAD] __aligned(8);
@@ -308,7 +308,7 @@ static int venc_service(struct mtk_vcp_venc_inst *inst, u32 id,
 			}
 			break;
 		case VCP_ENC_CHECK_ID:
-			ret = request_value == VCP_CODEC_H264_ENCODER ?
+			ret = request_value == inst->codec_id ?
 				0 : -1;
 			response.hw.hdr.status = cpu_to_le32(ret);
 			dev_info_ratelimited(enc->dev,
@@ -482,6 +482,7 @@ struct mtk_vcp_venc_inst *mtk_vcp_venc_new(struct mtk_vcp_venc *enc)
 	if (!inst)
 		return ERR_PTR(-ENOMEM);
 	inst->enc = enc;
+	inst->codec_id = VCP_CODEC_H264_ENCODER;
 	INIT_LIST_HEAD(&inst->allocations);
 	INIT_LIST_HEAD(&inst->dma_buffers);
 	init_completion(&inst->reply);
@@ -541,6 +542,33 @@ out:
 	kfree(formats);
 	kfree(sizes);
 }
+
+int mtk_vcp_venc_set_codec(struct mtk_vcp_venc_inst *inst, u32 fourcc)
+{
+	u32 id;
+	int ret = 0;
+
+	switch (fourcc) {
+	case V4L2_PIX_FMT_H264:
+		id = VCP_CODEC_H264_ENCODER;
+		break;
+	case V4L2_PIX_FMT_HEVC:
+		id = VCP_CODEC_HEVC_ENCODER;
+		break;
+	default:
+		return -EINVAL;
+	}
+	mutex_lock(&inst->enc->api_lock);
+	mutex_lock(&inst->enc->rx_lock);
+	if (inst->initialized || inst->broken)
+		ret = -EBUSY;
+	else
+		inst->codec_id = id;
+	mutex_unlock(&inst->enc->rx_lock);
+	mutex_unlock(&inst->enc->api_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mtk_vcp_venc_set_codec);
 
 int mtk_vcp_venc_init(struct mtk_vcp_venc_inst *inst)
 {
@@ -936,6 +964,7 @@ EXPORT_SYMBOL_GPL(mtk_vcp_venc_submit);
 
 int mtk_vcp_venc_submit_vb2(struct mtk_vcp_venc_inst *inst, unsigned int mode,
 	struct vb2_buffer *source, struct vb2_buffer *destination,
+	const struct vcp_venc_input_layout *layout,
 	struct vcp_venc_buffer_ids *ids)
 {
 	struct mtk_vcp_venc *enc = inst->enc;
@@ -969,21 +998,18 @@ int mtk_vcp_venc_submit_vb2(struct mtk_vcp_venc_inst *inst, unsigned int mode,
 		goto out;
 	}
 	if (source) {
-		if (!source->num_planes || source->num_planes > 3) {
+		if (!layout || !source->num_planes || source->num_planes > 3 ||
+		    source->num_planes != layout->planes) {
 			ret = -EINVAL;
 			goto out;
 		}
 		for (i = 0; i < source->num_planes; i++) {
 			struct vb2_plane *p = &source->planes[i];
 
-			/* bytesused describes the userspace payload, which may omit
-			 * stride padding required by the encoder. Firmware may leave its
-			 * sizeimage entry zero; when it supplies an additional minimum,
-			 * validate that span against the allocation length.
-			 */
+			/* Source payload and firmware DMA span use different layouts. */
 			if (p->bytesused > p->length || p->data_offset >= p->bytesused ||
-			    (inst->input_size[i] &&
-			     inst->input_size[i] > p->length - p->data_offset)) {
+			    layout->src_size[i] > p->bytesused - p->data_offset ||
+			    inst->input_size[i] > layout->dst_size[i]) {
 				dev_err(enc->dev,
 					"invalid VENC source plane %u: required=%u bytesused=%u length=%u offset=%u\n",
 					i, inst->input_size[i], p->bytesused,
@@ -991,7 +1017,7 @@ int mtk_vcp_venc_submit_vb2(struct mtk_vcp_venc_inst *inst, unsigned int mode,
 				ret = -EINVAL;
 				goto out;
 			}
-			bytes += p->length;
+			bytes += layout->dst_size[i];
 		}
 		for (; i < VCP_VENC_PLANES; i++) {
 			if (inst->input_size[i]) {
@@ -1012,7 +1038,7 @@ int mtk_vcp_venc_submit_vb2(struct mtk_vcp_venc_inst *inst, unsigned int mode,
 		goto out;
 	}
 	if (source) {
-		src = vcp_venc_dma_stage(enc->dev, source, DMA_TO_DEVICE);
+		src = vcp_venc_dma_stage_input(enc->dev, source, layout);
 		if (IS_ERR(src)) {
 			ret = PTR_ERR(src);
 			src = NULL;
@@ -1021,13 +1047,10 @@ int mtk_vcp_venc_submit_vb2(struct mtk_vcp_venc_inst *inst, unsigned int mode,
 		frame.planes = src->planes;
 		frame.timestamp = source->timestamp;
 		for (i = 0; i < src->planes; i++) {
-			/* Vendor ABI carries an offset-adjusted DMA address and
-			 * payload size, plus the original plane offset separately.
-			 */
-			frame.input[i] = src->plane[i].address + src->plane[i].offset;
-			frame.input_size[i] = source->planes[i].bytesused -
-					      src->plane[i].offset;
-			frame.data_offset[i] = src->plane[i].offset;
+			/* Input was repacked into private storage with no prefix. */
+			frame.input[i] = src->plane[i].address;
+			frame.input_size[i] = src->plane[i].size;
+			frame.data_offset[i] = 0;
 		}
 	}
 	if (destination) {

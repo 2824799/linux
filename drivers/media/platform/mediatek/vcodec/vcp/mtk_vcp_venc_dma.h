@@ -6,6 +6,8 @@
 #include <linux/list.h>
 #include <linux/types.h>
 
+#include "mtk_vcp_venc_layout.h"
+
 struct device;
 struct vb2_buffer;
 struct dma_buf;
@@ -35,6 +37,8 @@ struct vcp_venc_dma_buffer {
  */
 struct vcp_venc_dma_buffer *vcp_venc_dma_stage(struct device *dev,
 	struct vb2_buffer *vb, enum dma_data_direction direction);
+struct vcp_venc_dma_buffer *vcp_venc_dma_stage_input(struct device *dev,
+	struct vb2_buffer *vb, const struct vcp_venc_input_layout *layout);
 int vcp_venc_dma_copy_output(struct vcp_venc_dma_buffer *buffer, u32 bytes);
 /* Only before submission, after firmware return/DEINIT, or after confirmed
  * VCP and VENC quiescence. The caller serializes record access.

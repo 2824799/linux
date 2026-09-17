@@ -6,29 +6,31 @@
 
 #include "mtk_vcodec_enc.h"
 #include "../vcp/mtk_vcp_venc_abi.h"
+#include "../vcp/mtk_vcp_venc_layout.h"
 #include "venc_drv_base.h"
 
-struct vcp_h264_pending {
+struct vcp_encoder_pending {
 	u64 frame_cookie, bitstream_cookie;
 	struct vb2_v4l2_buffer *src, *dst;
 	u64 timestamp;
 	struct v4l2_timecode timecode;
 };
 
-struct vcp_h264_handle {
+struct vcp_encoder_handle {
 	struct mtk_vcodec_enc_ctx *ctx;
 	struct mtk_vcodec_enc_dev *dev;
 	struct mtk_vcp_venc_inst *inst;
-	struct vcp_h264_pending pending[VCP_VENC_BUFFERS];
+	struct vcp_encoder_pending pending[VCP_VENC_BUFFERS];
+	struct vcp_venc_input_layout input_layout;
 	bool booted, initialized, configured, synchronous, serialized, failed;
 };
 
-static void vcp_h264_abort_pending(struct vcp_h264_handle *h)
+static void vcp_encoder_abort_pending(struct vcp_encoder_handle *h)
 {
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(h->pending); i++) {
-		struct vcp_h264_pending *p = &h->pending[i];
+		struct vcp_encoder_pending *p = &h->pending[i];
 
 		if (p->src)
 			v4l2_m2m_buf_done(p->src, VB2_BUF_STATE_ERROR);
@@ -40,7 +42,7 @@ static void vcp_h264_abort_pending(struct vcp_h264_handle *h)
 	}
 }
 
-static struct vcp_h264_pending *vcp_h264_pending_slot(struct vcp_h264_handle *h)
+static struct vcp_encoder_pending *vcp_encoder_pending_slot(struct vcp_encoder_handle *h)
 {
 	unsigned int i;
 
@@ -50,7 +52,7 @@ static struct vcp_h264_pending *vcp_h264_pending_slot(struct vcp_h264_handle *h)
 	return NULL;
 }
 
-static bool vcp_h264_pending_empty(struct vcp_h264_handle *h)
+static bool vcp_encoder_pending_empty(struct vcp_encoder_handle *h)
 {
 	unsigned int i;
 
@@ -60,10 +62,10 @@ static bool vcp_h264_pending_empty(struct vcp_h264_handle *h)
 	return true;
 }
 
-static int vcp_h264_complete(struct vcp_h264_handle *h,
+static int vcp_encoder_complete(struct vcp_encoder_handle *h,
 			     const struct vcp_venc_result *done)
 {
-	struct vcp_h264_pending *frame = NULL, *bitstream = NULL, *p;
+	struct vcp_encoder_pending *frame = NULL, *bitstream = NULL, *p;
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(h->pending); i++) {
@@ -106,13 +108,13 @@ static int vcp_h264_complete(struct vcp_h264_handle *h,
 /* enc_mutex serializes every caller. Failed cleanup remains device-owned;
  * neither a file close nor an INIT error may discard its ownership record.
  */
-static int vcp_h264_stop(struct vcp_h264_handle *h, bool graceful)
+static int vcp_encoder_stop(struct vcp_encoder_handle *h, bool graceful)
 {
 	struct mtk_vcodec_enc_dev *dev = h->dev;
 	int ret;
 
 	h->configured = false;
-	vcp_h264_abort_pending(h);
+	vcp_encoder_abort_pending(h);
 	if (graceful && h->inst && h->initialized) {
 		ret = mtk_vcp_venc_deinit(h->inst);
 		if (!ret && mtk_vcp_venc_hw_idle(dev->vcp_hw)) {
@@ -153,7 +155,7 @@ static int vcp_h264_stop(struct vcp_h264_handle *h, bool graceful)
 	return 0;
 }
 
-static void vcp_h264_dispose(struct vcp_h264_handle *h, int cleanup)
+static void vcp_encoder_dispose(struct vcp_encoder_handle *h, int cleanup)
 {
 	if (cleanup) {
 		h->dev->vcp_faulted = true;
@@ -164,18 +166,29 @@ static void vcp_h264_dispose(struct vcp_h264_handle *h, int cleanup)
 		return;
 	}
 	h->dev->vcp_session = NULL;
+	h->dev->vcp_faulted = false;
 	kfree(h);
 	module_put(THIS_MODULE);
 }
 
-static int vcp_h264_init(struct mtk_vcodec_enc_ctx *ctx)
+static int vcp_encoder_init(struct mtk_vcodec_enc_ctx *ctx)
 {
 	struct mtk_vcodec_enc_dev *dev = ctx->dev;
-	struct vcp_h264_handle *h;
+	struct vcp_encoder_handle *h;
 	int ret, cleanup;
 
-	if (!dev->vcp_venc || dev->vcp_faulted)
+	if (!dev->vcp_venc)
 		return -EIO;
+	if (dev->vcp_faulted) {
+		h = dev->vcp_session;
+		/* A live file must finish returning its buffers before recovery. */
+		if (!h || h->ctx)
+			return -EIO;
+		ret = vcp_encoder_stop(h, false);
+		if (ret)
+			return ret;
+		vcp_encoder_dispose(h, 0);
+	}
 	if (dev->vcp_session)
 		return -EBUSY;
 	h = kzalloc_obj(*h);
@@ -197,6 +210,9 @@ static int vcp_h264_init(struct mtk_vcodec_enc_ctx *ctx)
 		h->inst = NULL;
 		goto err;
 	}
+	ret = mtk_vcp_venc_set_codec(h->inst, ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc);
+	if (ret)
+		goto err;
 	ret = mtk_vcp_venc_init(h->inst);
 	if (ret) {
 		dev_err(&dev->plat_dev->dev, "VCP encoder INIT failed: %d\n", ret);
@@ -207,15 +223,29 @@ static int vcp_h264_init(struct mtk_vcodec_enc_ctx *ctx)
 	return 0;
 err:
 	/* An INIT timeout may already have caused firmware DMA allocations. */
-	cleanup = vcp_h264_stop(h, false);
-	vcp_h264_dispose(h, cleanup);
+	cleanup = vcp_encoder_stop(h, false);
+	vcp_encoder_dispose(h, cleanup);
 	return ret;
 }
 
-static int vcp_h264_set_param(void *handle, enum venc_set_param_type type,
+/* The shipped xaga image consumes the common firmware level enum, not the
+ * interleaved HEVC-only enum in the released vendor driver. Keep the wire
+ * values explicit: H.264-only entries leave holes between HEVC levels.
+ */
+static int vcp_hevc_level(unsigned int level, unsigned int tier)
+{
+	static const u8 main_tier[] = { 2, 8, 10, 13, 15, 18, 20, 23, 25, 27, 29, 31, 33 };
+
+	if (level >= ARRAY_SIZE(main_tier) || tier > V4L2_MPEG_VIDEO_HEVC_TIER_HIGH ||
+	    (tier == V4L2_MPEG_VIDEO_HEVC_TIER_HIGH && level < V4L2_MPEG_VIDEO_HEVC_LEVEL_4))
+		return -EINVAL;
+	return main_tier[level] + tier;
+}
+
+static int vcp_encoder_set_param(void *handle, enum venc_set_param_type type,
 				      struct venc_enc_param *p)
 {
-	struct vcp_h264_handle *h = handle;
+	struct vcp_encoder_handle *h = handle;
 	struct vcp_venc_config config = {};
 	u32 sizes[VCP_VENC_PLANES] = {};
 	u32 id, value = 0;
@@ -279,14 +309,18 @@ static int vcp_h264_set_param(void *handle, enum venc_set_param_type type,
 		return -EINVAL;
 	}
 	q = &h->ctx->q_data[MTK_Q_DATA_SRC];
+	ret = vcp_venc_calc_layout(q->fmt->fourcc, q->coded_width,
+				   q->coded_height, &h->input_layout);
+	if (ret)
+		return ret;
 	/* Despite its name this vendor field contains venc_yuv_fmt, not FourCC. */
 	config.input_fourcc = cpu_to_le32(p->input_yuv_fmt);
 	config.bitrate = cpu_to_le32(p->bitrate);
 	config.bitratemode = cpu_to_le32(V4L2_MPEG_VIDEO_BITRATE_MODE_CBR);
 	config.pic_w = cpu_to_le32(q->visible_width);
 	config.pic_h = cpu_to_le32(q->visible_height);
-	config.buf_w = cpu_to_le32(q->coded_width);
-	config.buf_h = cpu_to_le32(q->coded_height);
+	config.buf_w = cpu_to_le32(h->input_layout.buf_width);
+	config.buf_h = cpu_to_le32(h->input_layout.buf_height);
 	config.gop_size = cpu_to_le32(p->gop_size);
 	config.intra_period = cpu_to_le32(p->intra_period);
 	config.framerate = cpu_to_le32(p->frm_rate);
@@ -294,6 +328,23 @@ static int vcp_h264_set_param(void *handle, enum venc_set_param_type type,
 	config.level = cpu_to_le32(p->h264_level);
 	config.num_b_frame = cpu_to_le32(0);
 	config.max_qp = cpu_to_le32(h->ctx->enc_params.h264_max_qp);
+	if (h->ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_HEVC) {
+		const struct mtk_enc_params *params = &h->ctx->enc_params;
+		bool ten_bit = params->hevc_profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10;
+
+		/* Profile and level are firmware values, not V4L2 enum ordinals. */
+		if ((!ten_bit && params->hevc_profile != V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN) ||
+		    params->hevc_level > V4L2_MPEG_VIDEO_HEVC_LEVEL_6_2 ||
+		    params->hevc_tier > V4L2_MPEG_VIDEO_HEVC_TIER_HIGH ||
+		    ten_bit != (p->input_yuv_fmt == VENC_YUV_FORMAT_P010))
+			return -EINVAL;
+		ret = vcp_hevc_level(params->hevc_level, params->hevc_tier);
+		if (ret < 0)
+			return ret;
+		config.profile = cpu_to_le32(ten_bit ? 4 : 2);
+		config.level = cpu_to_le32(ret);
+		config.max_qp = cpu_to_le32(params->hevc_max_qp);
+	}
 	h->configured = false;
 	ret = mtk_vcp_venc_configure(h->inst, &config, sizes, &synchronous);
 	if (ret)
@@ -301,11 +352,10 @@ static int vcp_h264_set_param(void *handle, enum venc_set_param_type type,
 	/* In asynchronous mode normal frames are completed by PUT_BUFFER work. */
 	for (i = 0; i < VCP_VENC_PLANES; i++) {
 		if (i < q->fmt->num_planes) {
-			/* Some VCP firmware revisions leave optional sizeimage entries
-			 * zero. The V4L2 capture format already owns the usable buffer
-			 * size; reject only a firmware requirement that exceeds it.
+			/* Firmware minima apply to private padded DMA storage, not
+			 * to the public source allocation.
 			 */
-			if (sizes[i] > q->sizeimage[i]) {
+			if (sizes[i] > h->input_layout.dst_size[i]) {
 				ret = -EINVAL;
 				goto rollback;
 			}
@@ -333,7 +383,7 @@ rollback:
 	 * about whether frame submission is allowed.
 	 */
 	h->failed = true;
-	cleanup = vcp_h264_stop(h, true);
+	cleanup = vcp_encoder_stop(h, true);
 	if (cleanup) {
 		h->dev->vcp_faulted = true;
 		dev_err(&h->dev->plat_dev->dev,
@@ -342,14 +392,14 @@ rollback:
 	return ret;
 }
 
-static int vcp_h264_encode(void *handle, enum venc_start_opt opt,
+static int vcp_encoder_encode(void *handle, enum venc_start_opt opt,
 				   struct venc_frm_buf *frm, struct mtk_vcodec_mem *bs,
 				   struct venc_done_result *result)
 {
-	struct vcp_h264_handle *h = handle;
+	struct vcp_encoder_handle *h = handle;
 	struct vcp_venc_result done;
 	struct vcp_venc_buffer_ids ids;
-	struct vcp_h264_pending *pending = NULL;
+	struct vcp_encoder_pending *pending = NULL;
 	unsigned long deadline;
 	bool frame_done, bitstream_done = false;
 	int ret, cleanup;
@@ -371,7 +421,7 @@ static int vcp_h264_encode(void *handle, enum venc_start_opt opt,
 		if (!h->ctx->active_src)
 			return -EINVAL;
 		if (!h->synchronous && !h->serialized) {
-			pending = vcp_h264_pending_slot(h);
+			pending = vcp_encoder_pending_slot(h);
 			if (!pending)
 				return -ENOSPC;
 		}
@@ -382,7 +432,7 @@ static int vcp_h264_encode(void *handle, enum venc_start_opt opt,
 			opt == VENC_START_OPT_ENCODE_FRAME_FINAL ? NULL :
 				h->ctx->active_src,
 			opt == VENC_START_OPT_ENCODE_FRAME_FINAL ? NULL :
-				h->ctx->active_dst, &ids);
+				h->ctx->active_dst, &h->input_layout, &ids);
 	if (ret)
 		goto fail;
 	if (pending) {
@@ -406,13 +456,13 @@ static int vcp_h264_encode(void *handle, enum venc_start_opt opt,
 			long left;
 
 			while (!(ret = mtk_vcp_venc_dequeue(h->inst, &done))) {
-				ret = vcp_h264_complete(h, &done);
+				ret = vcp_encoder_complete(h, &done);
 				if (ret)
 					goto fail;
 			}
 			if (ret != -EAGAIN)
 				goto fail;
-			if (vcp_h264_pending_empty(h))
+			if (vcp_encoder_pending_empty(h))
 				return 0;
 			left = deadline - jiffies;
 			if (left <= 0) {
@@ -473,7 +523,7 @@ fail:
 	h->failed = true;
 	h->ctx->state = MTK_STATE_ABORT;
 	memset(result, 0, sizeof(*result));
-	cleanup = vcp_h264_stop(h, false);
+	cleanup = vcp_encoder_stop(h, false);
 	if (cleanup) {
 		h->dev->vcp_faulted = true;
 		dev_err(&h->dev->plat_dev->dev,
@@ -483,9 +533,9 @@ fail:
 	return ret;
 }
 
-void venc_vcp_h264_buffers_ready(struct mtk_vcodec_enc_dev *dev)
+void venc_vcp_encoder_buffers_ready(struct mtk_vcodec_enc_dev *dev)
 {
-	struct vcp_h264_handle *h = dev->vcp_session;
+	struct vcp_encoder_handle *h = dev->vcp_session;
 	struct vcp_venc_result done;
 	unsigned int completed = 0;
 	int ret, cleanup;
@@ -498,7 +548,7 @@ void venc_vcp_h264_buffers_ready(struct mtk_vcodec_enc_dev *dev)
 			 "VENC dequeue: frame=%#llx bitstream=%#llx bytes=%u keyframe=%u\n",
 			 done.frame_cookie, done.bitstream_cookie, done.bytes,
 			 done.keyframe);
-		ret = vcp_h264_complete(h, &done);
+		ret = vcp_encoder_complete(h, &done);
 		if (ret)
 			break;
 		completed++;
@@ -512,10 +562,10 @@ void venc_vcp_h264_buffers_ready(struct mtk_vcodec_enc_dev *dev)
 	}
 	h->failed = true;
 	h->ctx->state = MTK_STATE_ABORT;
-	vcp_h264_abort_pending(h);
+	vcp_encoder_abort_pending(h);
 	vb2_queue_error(&h->ctx->m2m_ctx->out_q_ctx.q);
 	vb2_queue_error(&h->ctx->m2m_ctx->cap_q_ctx.q);
-	cleanup = vcp_h264_stop(h, false);
+	cleanup = vcp_encoder_stop(h, false);
 	if (cleanup) {
 		dev->vcp_faulted = true;
 		dev_err(&dev->plat_dev->dev,
@@ -527,21 +577,21 @@ void venc_vcp_h264_buffers_ready(struct mtk_vcodec_enc_dev *dev)
 	}
 }
 
-static int vcp_h264_deinit(void *handle)
+static int vcp_encoder_deinit(void *handle)
 {
-	struct vcp_h264_handle *h = handle;
+	struct vcp_encoder_handle *h = handle;
 	int ret;
 
 	if (!h)
 		return 0;
-	ret = vcp_h264_stop(h, !h->failed);
-	vcp_h264_dispose(h, ret);
+	ret = vcp_encoder_stop(h, !h->failed);
+	vcp_encoder_dispose(h, ret);
 	return ret;
 }
 
-const struct venc_common_if venc_vcp_h264_if = {
-	.init = vcp_h264_init,
-	.encode = vcp_h264_encode,
-	.set_param = vcp_h264_set_param,
-	.deinit = vcp_h264_deinit,
+const struct venc_common_if venc_vcp_encoder_if = {
+	.init = vcp_encoder_init,
+	.encode = vcp_encoder_encode,
+	.set_param = vcp_encoder_set_param,
+	.deinit = vcp_encoder_deinit,
 };

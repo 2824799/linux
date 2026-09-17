@@ -12,6 +12,7 @@
 
 #include "mtk_vcodec_enc.h"
 #include "venc_drv_if.h"
+#include "../vcp/mtk_vcp_venc_layout.h"
 
 #define MTK_VENC_MIN_W	160U
 #define MTK_VENC_MIN_H	128U
@@ -46,8 +47,8 @@ static const struct v4l2_frmsize_stepwise mtk_venc_4k_framesizes = {
 };
 
 static const struct v4l2_frmsize_stepwise mtk_venc_vcp_framesizes = {
-	MTK_VENC_MIN_W, MTK_VENC_VCP_MAX_W, 16,
-	MTK_VENC_MIN_H, MTK_VENC_VCP_MAX_H, 16,
+	MTK_VENC_MIN_W, MTK_VENC_VCP_MAX_W, 2,
+	MTK_VENC_MIN_H, MTK_VENC_VCP_MAX_H, 2,
 };
 
 /*
@@ -132,6 +133,18 @@ static int vidioc_venc_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_H264_LEVEL:
 		mtk_v4l2_venc_dbg(2, ctx, "V4L2_CID_MPEG_VIDEO_H264_LEVEL val = %d", ctrl->val);
 		p->h264_level = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_VIDEO_HEVC_PROFILE:
+		p->hevc_profile = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_VIDEO_HEVC_LEVEL:
+		p->hevc_level = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_VIDEO_HEVC_TIER:
+		p->hevc_tier = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP:
+		p->hevc_max_qp = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_H264_I_PERIOD:
 		mtk_v4l2_venc_dbg(2, ctx, "V4L2_CID_MPEG_VIDEO_H264_I_PERIOD val = %d", ctrl->val);
@@ -358,6 +371,30 @@ static int vidioc_try_fmt_out(struct mtk_vcodec_enc_ctx *ctx, struct v4l2_format
 	pix_fmt_mp->height = clamp(pix_fmt_mp->height, MTK_VENC_MIN_H, max_height);
 	pix_fmt_mp->width = clamp(pix_fmt_mp->width, MTK_VENC_MIN_W, max_width);
 
+	if (ctx->dev->venc_pdata->uses_vcp) {
+		struct vcp_venc_input_layout layout;
+		unsigned int i;
+		int ret;
+
+		/* The public image has source rows, not the private DMA padding.
+		 * TRY/S/G_FMT must agree, including contiguous chroma offsets.
+		 */
+		pix_fmt_mp->width = ALIGN(pix_fmt_mp->width, 2);
+		pix_fmt_mp->height = ALIGN(pix_fmt_mp->height, 2);
+		ret = vcp_venc_calc_layout(fmt->fourcc, pix_fmt_mp->width,
+					   pix_fmt_mp->height, &layout);
+		if (ret)
+			return ret;
+		pix_fmt_mp->num_planes = layout.planes;
+		memset(pix_fmt_mp->plane_fmt, 0, sizeof(pix_fmt_mp->plane_fmt));
+		for (i = 0; i < layout.planes; i++) {
+			pix_fmt_mp->plane_fmt[i].bytesperline = layout.stride[i];
+			pix_fmt_mp->plane_fmt[i].sizeimage = layout.src_size[i];
+		}
+		pix_fmt_mp->flags = 0;
+		return 0;
+	}
+
 	/* find next closer width align 16, height align 32, size align
 	 * 64 rectangle
 	 */
@@ -495,12 +532,28 @@ static int vidioc_venc_s_fmt_cap(struct file *file, void *priv,
 	}
 
 	fmt = mtk_venc_find_format(f->fmt.pix.pixelformat, pdata);
-	if (!fmt) {
+	if (!fmt || fmt->type != MTK_FMT_ENC) {
 		fmt = &ctx->dev->venc_pdata->capture_formats[0];
 		f->fmt.pix.pixelformat = fmt->fourcc;
 	}
 
+	/* Codec selection happens during INIT, before either queue streams. */
+	if (pdata->uses_vcp && q_data->fmt != fmt && ctx->drv_handle) {
+		if (vb2_is_busy(v4l2_m2m_get_src_vq(ctx->m2m_ctx)))
+			return -EBUSY;
+		ret = venc_if_deinit(ctx);
+		ctx->state = MTK_STATE_FREE;
+		if (ret)
+			return ret;
+	}
 	q_data->fmt = fmt;
+	/* Coded geometry follows the raw input and crop, never the caller's
+	 * CAPTURE dimensions (stateful encoder API, read-only fields).
+	 */
+	if (pdata->uses_vcp) {
+		f->fmt.pix_mp.width = ctx->q_data[MTK_Q_DATA_SRC].visible_width;
+		f->fmt.pix_mp.height = ctx->q_data[MTK_Q_DATA_SRC].visible_height;
+	}
 	vidioc_try_fmt_cap(f);
 
 	q_data->coded_width = f->fmt.pix_mp.width;
@@ -537,8 +590,6 @@ static int vidioc_venc_s_fmt_out(struct file *file, void *priv,
 	struct mtk_q_data *q_data = mtk_venc_get_q_data(ctx, f->type);
 	int ret, i;
 	const struct mtk_video_fmt *fmt;
-	unsigned int visible_w = f->fmt.pix_mp.width;
-	unsigned int visible_h = f->fmt.pix_mp.height;
 
 	vq = v4l2_m2m_get_vq(ctx->m2m_ctx, f->type);
 
@@ -548,7 +599,7 @@ static int vidioc_venc_s_fmt_out(struct file *file, void *priv,
 	}
 
 	fmt = mtk_venc_find_format(f->fmt.pix.pixelformat, pdata);
-	if (!fmt) {
+	if (!fmt || fmt->type != MTK_FMT_FRAME) {
 		fmt = &ctx->dev->venc_pdata->output_formats[0];
 		f->fmt.pix.pixelformat = fmt->fourcc;
 	}
@@ -560,23 +611,8 @@ static int vidioc_venc_s_fmt_out(struct file *file, void *priv,
 	q_data->fmt = fmt;
 	q_data->coded_width = f->fmt.pix_mp.width;
 	q_data->coded_height = f->fmt.pix_mp.height;
-	if (pdata->uses_vcp) {
-		/* try_fmt clamps the coded size to the supported range and aligns
-		 * it up; the requested size stays visible and is expressed to
-		 * firmware through the crop path. Clamp the request into that range
-		 * before rounding up to the H.264 4:2:0 two-pixel crop unit, so the
-		 * result is always representable and never overflows on extreme
-		 * requests.
-		 */
-		unsigned int w = clamp(visible_w, MTK_VENC_MIN_W, q_data->coded_width);
-		unsigned int h = clamp(visible_h, MTK_VENC_MIN_H, q_data->coded_height);
-
-		q_data->visible_width = min(ALIGN(w, 2), q_data->coded_width);
-		q_data->visible_height = min(ALIGN(h, 2), q_data->coded_height);
-	} else {
-		q_data->visible_width = q_data->coded_width;
-		q_data->visible_height = q_data->coded_height;
-	}
+	q_data->visible_width = q_data->coded_width;
+	q_data->visible_height = q_data->coded_height;
 
 	q_data->field = f->fmt.pix_mp.field;
 	ctx->colorspace = f->fmt.pix_mp.colorspace;
@@ -605,6 +641,13 @@ static int vidioc_venc_g_fmt(struct file *file, void *priv,
 
 	pix->width = q_data->coded_width;
 	pix->height = q_data->coded_height;
+	if (ctx->dev->venc_pdata->uses_vcp && !V4L2_TYPE_IS_OUTPUT(f->type)) {
+		/* CAPTURE reports coded dimensions selected by the OUTPUT queue.
+		 * A stateful encoder does not expose a selectable capture crop.
+		 */
+		pix->width = ctx->q_data[MTK_Q_DATA_SRC].visible_width;
+		pix->height = ctx->q_data[MTK_Q_DATA_SRC].visible_height;
+	}
 	pix->pixelformat = q_data->fmt->fourcc;
 	pix->field = q_data->field;
 	pix->num_planes = q_data->fmt->num_planes;
@@ -630,7 +673,7 @@ static int vidioc_try_fmt_vid_cap_mplane(struct file *file, void *priv,
 	const struct mtk_vcodec_enc_pdata *pdata = ctx->dev->venc_pdata;
 
 	fmt = mtk_venc_find_format(f->fmt.pix.pixelformat, pdata);
-	if (!fmt) {
+	if (!fmt || fmt->type != MTK_FMT_ENC) {
 		fmt = &ctx->dev->venc_pdata->capture_formats[0];
 		f->fmt.pix.pixelformat = fmt->fourcc;
 	}
@@ -639,6 +682,13 @@ static int vidioc_try_fmt_vid_cap_mplane(struct file *file, void *priv,
 	f->fmt.pix_mp.quantization = ctx->quantization;
 	f->fmt.pix_mp.xfer_func = ctx->xfer_func;
 
+	/* Coded geometry follows the raw input and crop, never the caller's
+	 * CAPTURE dimensions (stateful encoder API, read-only fields).
+	 */
+	if (pdata->uses_vcp) {
+		f->fmt.pix_mp.width = ctx->q_data[MTK_Q_DATA_SRC].visible_width;
+		f->fmt.pix_mp.height = ctx->q_data[MTK_Q_DATA_SRC].visible_height;
+	}
 	vidioc_try_fmt_cap(f);
 
 	return 0;
@@ -652,7 +702,7 @@ static int vidioc_try_fmt_vid_out_mplane(struct file *file, void *priv,
 	const struct mtk_vcodec_enc_pdata *pdata = ctx->dev->venc_pdata;
 
 	fmt = mtk_venc_find_format(f->fmt.pix.pixelformat, pdata);
-	if (!fmt) {
+	if (!fmt || fmt->type != MTK_FMT_FRAME) {
 		fmt = &ctx->dev->venc_pdata->output_formats[0];
 		f->fmt.pix.pixelformat = fmt->fourcc;
 	}
@@ -704,6 +754,11 @@ static int vidioc_venc_s_selection(struct file *file, void *priv,
 
 	if (s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
 		return -EINVAL;
+
+	if (ctx->dev->venc_pdata->uses_vcp &&
+	    (vb2_is_streaming(&ctx->m2m_ctx->out_q_ctx.q) ||
+	     vb2_is_streaming(&ctx->m2m_ctx->cap_q_ctx.q)))
+		return -EBUSY;
 
 	switch (s->target) {
 	case V4L2_SEL_TGT_CROP:
@@ -834,6 +889,14 @@ static int vidioc_encoder_cmd(struct file *file, void *priv,
 	return 0;
 }
 
+static int vidioc_venc_subscribe_event(struct v4l2_fh *fh,
+				      const struct v4l2_event_subscription *sub)
+{
+	if (sub->type == V4L2_EVENT_EOS)
+		return v4l2_event_subscribe(fh, sub, 2, NULL);
+	return v4l2_ctrl_subscribe_event(fh, sub);
+}
+
 const struct v4l2_ioctl_ops mtk_venc_ioctl_ops = {
 	.vidioc_streamon		= v4l2_m2m_ioctl_streamon,
 	.vidioc_streamoff		= v4l2_m2m_ioctl_streamoff,
@@ -851,7 +914,7 @@ const struct v4l2_ioctl_ops mtk_venc_ioctl_ops = {
 	.vidioc_try_fmt_vid_cap_mplane	= vidioc_try_fmt_vid_cap_mplane,
 	.vidioc_try_fmt_vid_out_mplane	= vidioc_try_fmt_vid_out_mplane,
 	.vidioc_expbuf			= v4l2_m2m_ioctl_expbuf,
-	.vidioc_subscribe_event		= v4l2_ctrl_subscribe_event,
+	.vidioc_subscribe_event		= vidioc_venc_subscribe_event,
 	.vidioc_unsubscribe_event	= v4l2_event_unsubscribe,
 
 	.vidioc_s_parm			= vidioc_venc_s_parm,
@@ -949,7 +1012,8 @@ static int vb2ops_venc_start_streaming(struct vb2_queue *q, unsigned int count)
 	/* Once state turn into MTK_STATE_ABORT, we need stop_streaming
 	  * to clear it
 	  */
-	if ((ctx->state == MTK_STATE_ABORT) || (ctx->state == MTK_STATE_FREE)) {
+	if (ctx->state == MTK_STATE_ABORT ||
+	    (ctx->state == MTK_STATE_FREE && !ctx->dev->venc_pdata->uses_vcp)) {
 		ret = -EIO;
 		goto err_start_stream;
 	}
@@ -963,6 +1027,13 @@ static int vb2ops_venc_start_streaming(struct vb2_queue *q, unsigned int count)
 			return 0;
 	}
 
+	/* A client may STREAMON the valid default formats without S_FMT. */
+	if (ctx->state == MTK_STATE_FREE) {
+		ret = venc_if_init(ctx, ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc);
+		if (ret)
+			goto err_start_stream;
+		ctx->state = MTK_STATE_INIT;
+	}
 	mtk_venc_set_param(ctx, &param);
 	ret = venc_if_set_param(ctx, VENC_SET_PARAM_ENC, &param);
 	if (ret) {
@@ -972,7 +1043,8 @@ static int vb2ops_venc_start_streaming(struct vb2_queue *q, unsigned int count)
 	}
 	ctx->param_change = MTK_ENCODE_PARAM_NONE;
 
-	if ((ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_H264) &&
+	if ((ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_H264 ||
+	     ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_HEVC) &&
 	    (ctx->enc_params.seq_hdr_mode !=
 				V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE)) {
 		ret = venc_if_set_param(ctx,
@@ -1285,6 +1357,7 @@ static void mtk_venc_worker(struct work_struct *work)
 		vb2_set_plane_payload(&dst_buf->vb2_buf, 0, 0);
 		dst_buf->flags |= V4L2_BUF_FLAG_LAST;
 		v4l2_m2m_buf_done(dst_buf, VB2_BUF_STATE_DONE);
+		v4l2_event_queue_fh(&ctx->fh, &(struct v4l2_event){ .type = V4L2_EVENT_EOS });
 		v4l2_m2m_job_finish(ctx->dev->m2m_dev_enc, ctx->m2m_ctx);
 		return;
 	}
@@ -1343,9 +1416,10 @@ static void m2mops_venc_device_run(void *priv)
 	if (ret)
 		goto abort;
 
-	if ((ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_H264) &&
+	if ((ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_H264 ||
+	     ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_HEVC) &&
 	    (ctx->state != MTK_STATE_HEADER)) {
-		/* encode h264 sps/pps header */
+		/* Emit the codec sequence header before the first picture. */
 		ret = mtk_venc_encode_header(ctx);
 		if (ret)
 			goto abort;
@@ -1441,6 +1515,22 @@ void mtk_vcodec_enc_set_default_params(struct mtk_vcodec_enc_ctx *ctx)
 		(ALIGN(q_data->coded_width, 16) * 16);
 	q_data->bytesperline[1] = q_data->coded_width;
 
+	if (ctx->dev->venc_pdata->uses_vcp) {
+		struct v4l2_format f = {
+			.fmt.pix_mp.width = DFT_CFG_WIDTH,
+			.fmt.pix_mp.height = DFT_CFG_HEIGHT,
+		};
+		unsigned int i;
+
+		vidioc_try_fmt_out(ctx, &f, q_data->fmt);
+		q_data->coded_width = f.fmt.pix_mp.width;
+		q_data->coded_height = f.fmt.pix_mp.height;
+		for (i = 0; i < q_data->fmt->num_planes; i++) {
+			q_data->sizeimage[i] = f.fmt.pix_mp.plane_fmt[i].sizeimage;
+			q_data->bytesperline[i] = f.fmt.pix_mp.plane_fmt[i].bytesperline;
+		}
+	}
+
 	q_data = &ctx->q_data[MTK_Q_DATA_DST];
 	memset(q_data, 0, sizeof(struct mtk_q_data));
 	q_data->coded_width = DFT_CFG_WIDTH;
@@ -1505,6 +1595,18 @@ int mtk_vcodec_enc_ctrls_setup(struct mtk_vcodec_enc_ctx *ctx)
 	v4l2_ctrl_new_std_menu(handler, ops, V4L2_CID_MPEG_VIDEO_H264_LEVEL,
 			       h264_max_level,
 			       0, V4L2_MPEG_VIDEO_H264_LEVEL_4_0);
+	if (vcp) {
+		v4l2_ctrl_new_std_menu(handler, ops, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
+			V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10,
+			BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_STILL_PICTURE),
+			V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
+		v4l2_ctrl_new_std_menu(handler, ops, V4L2_CID_MPEG_VIDEO_HEVC_LEVEL,
+			V4L2_MPEG_VIDEO_HEVC_LEVEL_6_2, 0, V4L2_MPEG_VIDEO_HEVC_LEVEL_4);
+		v4l2_ctrl_new_std_menu(handler, ops, V4L2_CID_MPEG_VIDEO_HEVC_TIER,
+			V4L2_MPEG_VIDEO_HEVC_TIER_HIGH, 0, V4L2_MPEG_VIDEO_HEVC_TIER_MAIN);
+		v4l2_ctrl_new_std(handler, ops, V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP,
+			0, 51, 1, 51);
+	}
 	if (!vcp)
 		v4l2_ctrl_new_std_menu(handler, ops, V4L2_CID_MPEG_VIDEO_VP8_PROFILE,
 			V4L2_MPEG_VIDEO_VP8_PROFILE_0, 0, V4L2_MPEG_VIDEO_VP8_PROFILE_0);

@@ -5,6 +5,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of_platform.h>
 #include <linux/overflow.h>
@@ -15,6 +16,15 @@
 #include <linux/regulator/consumer.h>
 #include "mtk_vcp_vdec_hw.h"
 
+#define VDEC_CORES 2
+#define VDEC_BREAK 0x100
+#define VDEC_BREAK_STATUS 0x104
+#define VDEC_BREAK_IDLE 0x11
+#define VDEC_SW_RESET 0x108
+#define VDEC_UFO_CONTROL 0x1c
+#define VDEC_UFO_STATUS 0x8c
+#define VDEC_UFO_IDLE 0x11000
+
 /* Highest operating point of the vendor OPP table: 660 MHz at 750 mV. */
 #define VDEC_MAX_RATE 660000000UL
 
@@ -22,7 +32,7 @@
 #define VCPDBG(fmt, ...) pr_info("VCPDBG:%s: " fmt, __func__, ##__VA_ARGS__)
 
 struct vdec_core {
-	void __iomem *misc;
+	void __iomem *misc, *vld;
 	struct device *domain, *larb;
 	struct completion irq_done;
 	int irq;
@@ -31,6 +41,7 @@ struct vdec_core {
 struct mtk_vcp_vdec_hw {
 	struct device *dev, *ube;
 	struct mtk_vcp *vcp;
+	void __iomem *ufo;
 	struct clk_bulk_data clocks[3];
 	struct vdec_core core[2];
 	struct regulator *vcore;
@@ -46,10 +57,12 @@ struct mtk_vcp_vdec_hw {
 	 * names the step it actually needs.
 	 */
 	unsigned long max_uv;
-	/* A shutdown that did not complete leaves the cores possibly running. The
-	 * state is then uncertain forever: the step is never relaxed and no core
-	 * may be powered again.
+	/* PM references are acquired domains first, then LARBs. A failed put
+	 * consumes its reference, so pending suspend retries must not put again.
+	 * Keep the module and rail until all acquired resources are released.
 	 */
+	unsigned long pm_held, pm_pending;
+	bool pm_ref;
 	bool retained;
 	struct mutex perf_lock;
 	bool powered, uncertain;
@@ -140,10 +153,50 @@ static void vdec_vote_idle(struct mtk_vcp_vdec_hw *hw)
 	hw->active_uv = 0;
 }
 
+/* Engines must be idle, or this must be rollback before their clocks were
+ * enabled. Stop at the first failure: parent domains must remain referenced
+ * while a LARB's shutdown is unconfirmed. PM serializes each device's retry
+ * and preserves fatal runtime_error; never override that state here.
+ */
+static int vdec_pm_release(struct mtk_vcp_vdec_hw *hw)
+{
+	int i, ret;
+
+	for (i = 2 * VDEC_CORES - 1; i >= 0; i--) {
+		struct device *dev = i < VDEC_CORES ? hw->core[i].domain :
+				    hw->core[i - VDEC_CORES].larb;
+
+		if (hw->pm_held & BIT(i)) {
+			ret = pm_runtime_put_sync_suspend(dev);
+			hw->pm_held &= ~BIT(i);
+		} else if (hw->pm_pending & BIT(i)) {
+			ret = pm_runtime_suspend(dev);
+		} else {
+			continue;
+		}
+		if (ret < 0) {
+			hw->pm_pending |= BIT(i);
+			hw->retained = true;
+			dev_warn(hw->dev, "VDEC PM resource %d suspend failed: %d; retaining resources\n",
+				 i, ret);
+			return ret;
+		}
+		hw->pm_pending &= ~BIT(i);
+	}
+	hw->retained = false;
+	if (hw->pm_ref) {
+		hw->pm_ref = false;
+		module_put(THIS_MODULE);
+	}
+	return 0;
+}
+
 static int vdec_power_on(struct mtk_vcp_vdec_hw *hw)
 {
 	int domains = 0, larbs = 0, i, ret;
 
+	if (hw->retained)
+		return -EIO;
 	if (hw->powered)
 		return 0;
 	for (i = 0; i < 3; i++) {
@@ -161,27 +214,30 @@ static int vdec_power_on(struct mtk_vcp_vdec_hw *hw)
 	mutex_unlock(&hw->perf_lock);
 	if (ret)
 		return ret;
+	__module_get(THIS_MODULE);
+	hw->pm_ref = true;
 	for (; domains < 2; domains++) {
 		ret = pm_runtime_resume_and_get(hw->core[domains].domain);
 		if (ret < 0)
 			goto rollback;
+		hw->pm_held |= BIT(domains);
 	}
 	for (; larbs < 2; larbs++) {
 		ret = pm_runtime_resume_and_get(hw->core[larbs].larb);
 		if (ret < 0)
 			goto rollback;
+		hw->pm_held |= BIT(VDEC_CORES + larbs);
 	}
 	ret = clk_bulk_prepare_enable(3, hw->clocks);
 	if (ret)
 		goto rollback;
 	hw->powered = true;
-	__module_get(THIS_MODULE);
 	return 0;
 rollback:
-	while (larbs--)
-		pm_runtime_put_sync(hw->core[larbs].larb);
-	while (domains--)
-		pm_runtime_put_sync(hw->core[domains].domain);
+	/* Preserve the bring-up error. Failed rollback is recorded separately
+	 * and session teardown will retry it without consuming another PM ref.
+	 */
+	vdec_pm_release(hw);
 	return ret;
 }
 
@@ -359,56 +415,85 @@ void mtk_vcp_vdec_hw_free(struct mtk_vcp_vdec_hw *hw, u32 type, struct mtk_vcp_m
 	mem->cpu = NULL;
 }
 
+/* MT6895 xaga vendor mtk_vcodec_dec_hw_break(): request MISC break,
+ * wait for both idle bits (and UFO when enabled), then pulse VLD reset.
+ * Unlike the vendor timeout path, never reset or release DMA on timeout.
+ * Firmware must be offline so no callback can restart an engine mid-reset.
+ */
+static int vdec_break_core(struct mtk_vcp_vdec_hw *hw, unsigned int index)
+{
+	struct vdec_core *core = &hw->core[index];
+	u32 value;
+	bool ufo = !index && (readl(hw->ufo + VDEC_UFO_STATUS) & BIT(0));
+	int ret;
+
+	writel(readl(core->misc + VDEC_BREAK) | BIT(0), core->misc + VDEC_BREAK);
+	if (ufo)
+		writel(readl(hw->ufo + VDEC_UFO_CONTROL) & ~BIT(1),
+		       hw->ufo + VDEC_UFO_CONTROL);
+	ret = readl_poll_timeout(core->misc + VDEC_BREAK_STATUS, value,
+				(value & VDEC_BREAK_IDLE) == VDEC_BREAK_IDLE,
+				10, 1000000);
+	if (ret)
+		return ret;
+	if (ufo) {
+		ret = readl_poll_timeout(hw->ufo + VDEC_UFO_STATUS, value,
+					(value & VDEC_UFO_IDLE) == VDEC_UFO_IDLE,
+					10, 1000000);
+		if (ret)
+			return ret;
+		writel(readl(hw->ufo + VDEC_UFO_CONTROL) | BIT(1),
+		       hw->ufo + VDEC_UFO_CONTROL);
+	}
+	writel(1, core->vld + VDEC_SW_RESET);
+	writel(0, core->vld + VDEC_SW_RESET);
+	/* Complete the reset write before disabling its clock or PM domain. */
+	readl(core->vld + VDEC_SW_RESET);
+	reinit_completion(&core->irq_done);
+	core->owned = false;
+	return 0;
+}
+
+static int vdec_recover_engines(struct mtk_vcp_vdec_hw *hw)
+{
+	int i, ret;
+
+	if (!hw->uncertain && !hw->core[0].owned && !hw->core[1].owned)
+		return 0;
+	if (!hw->powered || !mtk_vcp_is_offline(hw->vcp))
+		return -EBUSY;
+	/* Stop LAT before CORE. Mark the whole engine set uncertain until both
+	 * resets complete; a partial failure must keep clocks, DMA and PM refs.
+	 */
+	hw->uncertain = true;
+	for (i = VDEC_CORES - 1; i >= 0; i--) {
+		ret = vdec_break_core(hw, i);
+		if (ret) {
+			dev_err(hw->dev, "VDEC core%d break failed: %d; retaining DMA\n", i, ret);
+			return ret;
+		}
+	}
+	hw->uncertain = false;
+	return 0;
+}
+
 int mtk_vcp_vdec_hw_stop(struct mtk_vcp_vdec_hw *hw)
 {
-	int i, ret, error = 0;
+	int ret;
 
 	VCPDBG("stop: powered=%d owned=%d/%d retained=%d uncertain=%d\n",
 	       hw->powered, hw->core[0].owned, hw->core[1].owned, hw->retained,
 	       hw->uncertain);
-	if (hw->uncertain || hw->core[0].owned || hw->core[1].owned) {
-		VCPDBG("stop: cores still owned or state uncertain\n");
-		return -EBUSY;
+	ret = vdec_recover_engines(hw);
+	if (ret)
+		return ret;
+	if (hw->powered) {
+		clk_bulk_disable_unprepare(3, hw->clocks);
+		hw->powered = false;
 	}
-	if (!hw->powered) {
-		/* Nothing this driver powered is running, so the rail does not have
-		 * to keep serving this codec while it stays idle. The stream's step
-		 * is given up, but the request returns to the top of the table so a
-		 * later session that powers up before its geometry is known is still
-		 * covered.
-		 */
-		mutex_lock(&hw->perf_lock);
-		vdec_vote_idle(hw);
-		hw->desired_uv = hw->max_uv;
-		mutex_unlock(&hw->perf_lock);
-		return 0;
-	}
-	clk_bulk_disable_unprepare(3, hw->clocks);
-	for (i = 1; i >= 0; i--) {
-		ret = pm_runtime_put_sync(hw->core[i].larb);
-		if (ret < 0) {
-			dev_warn(hw->dev, "LARB%u suspend failed: %d\n", i + 4, ret);
-			error = error ?: ret;
-		}
-	}
-	for (i = 1; i >= 0; i--) {
-		ret = pm_runtime_put_sync(hw->core[i].domain);
-		if (ret < 0) {
-			dev_warn(hw->dev, "VDEC domain%u suspend failed: %d\n", i, ret);
-			error = error ?: ret;
-		}
-	}
-	hw->powered = false;
-	module_put(THIS_MODULE);
-	if (error) {
-		/* A domain that did not suspend may still be executing, so the
-		 * request is kept and further power-ups are refused.
-		 */
-		hw->retained = true;
-		dev_warn(hw->dev, "VDEC shutdown incomplete: %d; retaining the %d uV VCORE request\n",
-			 error, hw->active_uv);
-		return error;
-	}
+	ret = vdec_pm_release(hw);
+	if (ret)
+		return ret;
 	mutex_lock(&hw->perf_lock);
 	vdec_vote_idle(hw);
 	hw->desired_uv = hw->max_uv;
@@ -477,6 +562,10 @@ struct mtk_vcp_vdec_hw *mtk_vcp_vdec_hw_create(struct platform_device *pdev,
 		if (ret)
 			return ERR_PTR(ret);
 	}
+	hw->ufo = devm_platform_ioremap_resource_byname(pdev, "base");
+	if (IS_ERR(hw->ufo))
+		return ERR_CAST(hw->ufo);
+	hw->ufo += 0x800;
 	for (i = 0; i < 2; i++) {
 		struct vdec_core *c = &hw->core[i];
 		struct device_node *node;
@@ -485,6 +574,9 @@ struct mtk_vcp_vdec_hw *mtk_vcp_vdec_hw_create(struct platform_device *pdev,
 		c->misc = devm_platform_ioremap_resource_byname(pdev, i ? "lat-misc" : "misc");
 		if (IS_ERR(c->misc))
 			return ERR_PTR(PTR_ERR(c->misc));
+		c->vld = devm_platform_ioremap_resource_byname(pdev, i ? "lat-vld" : "vld");
+		if (IS_ERR(c->vld))
+			return ERR_CAST(c->vld);
 		c->domain = dev_pm_domain_attach_by_id(dev, i);
 		if (IS_ERR_OR_NULL(c->domain))
 			return ERR_PTR(c->domain ? PTR_ERR(c->domain) : -ENODEV);

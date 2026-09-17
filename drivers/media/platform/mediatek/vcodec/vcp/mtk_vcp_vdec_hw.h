@@ -22,9 +22,13 @@ int mtk_vcp_vdec_hw_wait(struct mtk_vcp_vdec_hw *hw, unsigned int core);
 int mtk_vcp_vdec_hw_alloc(struct mtk_vcp_vdec_hw *hw, u32 type, size_t size,
 			struct mtk_vcp_mem *mem);
 void mtk_vcp_vdec_hw_free(struct mtk_vcp_vdec_hw *hw, u32 type, struct mtk_vcp_mem *mem);
-/* Call after successful DEINIT, or confirmed reset with no owned engines.
- * A nonzero return means a power domain did not suspend: the caller must keep
- * the session and the voltage request it holds. A successful stop ends the
+/* Call after successful DEINIT, or confirmed firmware shutdown.
+ * Uncertain/owned engines require VCP offline and successful hardware break
+ * and reset before PM references or DMA can be released.
+ * A nonzero return means shutdown was not confirmed: the caller must keep
+ * the session and the voltage request it holds. PM retries do not drop usage
+ * references twice; IRQ recovery failure retains clocks, references and DMA.
+ * A successful stop ends the
  * session and gives up the stream's step, leaving the request at the top of the
  * OPP table for a session that powers up before its geometry is known.
  */

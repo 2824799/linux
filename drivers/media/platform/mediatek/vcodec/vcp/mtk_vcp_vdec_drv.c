@@ -18,42 +18,19 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-vmalloc.h>
 #include "mtk_vcp_vdec_hw.h"
+#include "mtk_vcp_vdec_bitstream.h"
 
 #define DEC_SURFACES 36
-#define DEC_TIMESTAMPS 64
 
 static bool vdec_caps_dump;
 module_param_named(caps_dump, vdec_caps_dump, bool, 0644);
 MODULE_PARM_DESC(caps_dump, "dump the firmware decoder capability tables on session boot");
 
-/* The formats and frame size limits the MT6895 VCP firmware publishes through
- * VCP_VDEC_AP_QUERY_CAP, restricted to the ones this frontend can drive.
- *
- * The firmware lists ten input formats (H.264, H.265, HEIF, MPEG2, MPEG4,
- * H.263, VP8, VP9, AV1 and VC-1), but it does not serve all of them through
- * the interface this frontend implements. It reports the driving model in
- * vsi->input_driven: 2 (INPUT_DRIVEN_PUT_FRM) is the one the frontend submits
- * work in, 0 (NON_INPUT_DRIVEN) is not. Measured on MT6895:
- *
- *   H.264, H.265  input_driven 2; decode is pixel-identical to a reference
- *                 decode of the same stream
- *   VP9           input_driven 2; the luma plane is pixel-identical but the
- *                 firmware leaves the chroma plane blank
- *   VP8, MPEG2,
- *   MPEG4         input_driven 0
- *   AV1           no picture; the remoteproc watchdog resets the VCP core
- *   VC-1          published without a frame size range
- *
- * A stream the firmware cannot handle does not fail cleanly: it stops
- * answering and the watchdog resets the core, which leaves the frontend
- * holding a session whose DMA cannot be released. Only the formats below are
- * therefore advertised, so a client cannot reach the failing paths through
- * s_fmt and the next session starts on a healthy core.
- *
- * fourcc is the V4L2 format the frontend offers, vcp_fourcc is how the same
- * codec is spelled in the firmware tables, codec_id is the value the
- * VCP_VDEC_CHECK_CODEC_ID handshake carries, and size is the range the
- * firmware publishes for it.
+/* Expose only firmware codecs with implemented layout and queue contracts.
+ * VP9 profile 0 uses the same MM21 conversion, but firmware writes chroma
+ * immediately after luma regardless of the separate chroma address. Each
+ * surface therefore owns one contiguous Y+UV allocation for every codec.
+ * VP8 uses synchronous bitstream/frame submission; AV1 is unverified.
  */
 struct vdec_codec {
 	u32 fourcc;
@@ -66,6 +43,10 @@ static const struct vdec_codec vdec_codecs[] = {
 	{ V4L2_PIX_FMT_H264, v4l2_fourcc('H', '2', '6', '4'), VCP_VDEC_H264,
 	  { 16, 4096, 16, 16, 2176, 16 } },
 	{ V4L2_PIX_FMT_HEVC, v4l2_fourcc('H', '2', '6', '5'), VCP_VDEC_H265,
+	  { 16, 4096, 16, 16, 2176, 16 } },
+	{ V4L2_PIX_FMT_VP9, v4l2_fourcc('V', 'P', '9', '0'), VCP_VDEC_VP9,
+	  { 16, 4096, 16, 16, 2176, 16 } },
+	{ V4L2_PIX_FMT_VP8, v4l2_fourcc('V', 'P', '8', '0'), VCP_VDEC_VP8,
 	  { 16, 4096, 16, 16, 2176, 16 } },
 };
 
@@ -108,6 +89,7 @@ struct vdec_dev {
 	struct vdec_ctx *ctx;
 };
 struct vdec_surface {
+	/* plane[0] owns the entire allocation; plane[1] is a chroma view. */
 	struct mtk_vcp_mem plane[2];
 	u64 cookie;
 	bool free, pending;
@@ -132,13 +114,11 @@ struct vdec_ctx {
 	struct work_struct work;
 	wait_queue_head_t wait;
 	atomic_t notification;
-	bool booted, initialized, header, stopping, failed, orphan;
+	bool booted, initialized, header, stopping, failed, orphan, released;
 	bool source_done, draining, drained;
 	bool submitted;   /* head OUTPUT buffer handed to firmware, release pending */
 	bool last_pending; /* previous capture sequence still needs its LAST marker */
 	bool wait_capture; /* new sequence waits for the client to restart CAPTURE */
-	u64 src_ts[DEC_TIMESTAMPS];      /* OUTPUT timestamps, submission order */
-	u32 ts_read, ts_count;
 	u32 prev_dst_size[2], prev_dst_planes; /* CAPTURE geometry before the change */
 };
 
@@ -321,7 +301,7 @@ static int session_boot(struct vdec_ctx *c)
 		dev_info(c->dev->dev, "session boot failed: %d\n", ret);
 		VCPDBG("boot: vcp boot failed: %d, offline=%d\n", ret,
 		       mtk_vcp_is_offline(c->dev->vcp));
-		return ret;
+		goto rollback;
 	}
 	c->booted = true;
 	VCPDBG("boot: vcp running, offline=%d\n",
@@ -333,13 +313,13 @@ static int session_boot(struct vdec_ctx *c)
 	if (ret) {
 		dev_info(c->dev->dev, "session codec %#x rejected: %d\n",
 			 c->codec_id, ret);
-		return ret;
+		goto rollback;
 	}
 	ret = mtk_vcp_vdec_init(c->decoder);
 	if (ret) {
 		dev_info(c->dev->dev, "session init failed: %d\n", ret);
 		VCPDBG("boot: vdec init failed: %d\n", ret);
-		return ret;
+		goto rollback;
 	}
 	c->initialized = true;
 	ret = vdec_check_caps(c);
@@ -362,9 +342,9 @@ rollback:
 	{
 		int err = session_teardown(c);
 
-		cmpxchg(&c->dev->ctx, c, NULL);
 		if (err)
 			return err;
+		cmpxchg(&c->dev->ctx, c, NULL);
 	}
 	VCPDBG("boot: rolled back, ret=%d\n", ret);
 	return ret;
@@ -372,6 +352,8 @@ rollback:
 
 static int session_start(struct vdec_ctx *c)
 {
+	if (c->orphan || READ_ONCE(c->failed))
+		return -EIO;
 	/* A retained session is only usable once firmware and bitstream DMA
 	 * both exist.
 	 */
@@ -398,17 +380,28 @@ static int session_start(struct vdec_ctx *c)
  */
 static int session_teardown(struct vdec_ctx *c)
 {
-	int ret = 0, stopped, i, j;
+	int ret = 0, stopped, i;
 
 	if (!c->decoder)
 		return 0;
 	VCPDBG("teardown: init=%d boot=%d orphan=%d\n", c->initialized,
 	       c->booted, c->orphan);
-	if (c->initialized)
+	/* Before sequence parsing, service2 has no frame queue. Sending its
+	 * null FRAME_BUFFER flush at that point crashes xaga firmware. Stop
+	 * the VCP and use the reset cleanup path for such partial sessions.
+	 */
+	if (c->initialized && c->booted && c->header)
 		ret = mtk_vcp_vdec_deinit(c->decoder);
 	else
 		ret = -EIO;
+	if (!ret)
+		c->initialized = false;
 	stopped = c->booted ? mtk_vcp_shutdown(c->dev->vcp) : 0;
+	/* A successful shutdown consumes our reference even if later hardware
+	 * cleanup fails, or another codec keeps the VCP online.
+	 */
+	if (!stopped)
+		c->booted = false;
 	if (stopped || (ret && !mtk_vcp_is_offline(c->dev->vcp)) ||
 	    mtk_vcp_vdec_hw_stop(c->dev->hw)) {
 		VCPDBG("teardown: retain (deinit=%d shutdown=%d offline=%d)\n",
@@ -427,18 +420,20 @@ static int session_teardown(struct vdec_ctx *c)
 		dma_free_coherent(c->dev->bs_dev, c->bs.size, c->bs.cpu, c->bs.dma);
 	memset(&c->bs, 0, sizeof(c->bs));
 	for (i = 0; i < DEC_SURFACES; i++)
-		for (j = 0; j < 2; j++)
-			if (c->surfaces[i].plane[j].cpu)
-				codec_free(c, 1, &c->surfaces[i].plane[j]);
+		if (c->surfaces[i].plane[0].cpu)
+			codec_free(c, 1, &c->surfaces[i].plane[0]);
 	memset(c->surfaces, 0, sizeof(c->surfaces));
 	c->pool_count = 0;
 	c->pending_count = 0;
 	c->pending_read = 0;
-	c->ts_count = 0;
-	c->ts_read = 0;
+	if (c->orphan) {
+		c->orphan = false;
+		module_put(THIS_MODULE);
+	}
 	VCPDBG("teardown: complete\n");
 	return 0;
 retain:
+	WRITE_ONCE(c->failed, true);
 	if (!c->orphan) {
 		c->orphan = true;
 		__module_get(THIS_MODULE);
@@ -458,42 +453,22 @@ static int session_stop(struct vdec_ctx *c)
 	return 0;
 }
 
-static void push_source_timestamp(struct vdec_ctx *c, u64 timestamp)
-{
-	/* Firmware is ahead of the submissions: drop the oldest entry rather
-	 * than letting the ring grow without bound.
-	 */
-	if (c->ts_count == DEC_TIMESTAMPS) {
-		c->ts_read = (c->ts_read + 1) % DEC_TIMESTAMPS;
-		c->ts_count--;
-	}
-	c->src_ts[(c->ts_read + c->ts_count++) % DEC_TIMESTAMPS] = timestamp;
-	VCPDBG("ts: pushed %llu count=%u\n", timestamp, c->ts_count);
-}
-
-static u64 pop_source_timestamp(struct vdec_ctx *c)
-{
-	u64 timestamp;
-
-	if (!c->ts_count)
-		return 0;
-	timestamp = c->src_ts[c->ts_read];
-	c->ts_read = (c->ts_read + 1) % DEC_TIMESTAMPS;
-	c->ts_count--;
-	return timestamp;
-}
-
-/* A decoder has to copy the OUTPUT timestamp onto the buffer it hands back,
- * which is what V4L2_BUF_FLAG_TIMESTAMP_COPY promises the client. The
- * firmware is handed that timestamp with every access unit and echoes it in
- * its frame ring, but only while it returns the pictures in decode order: as
- * soon as it reorders for display (B pictures) the echoed field stops
- * describing the picture it is attached to, and has been seen carrying a
- * plain ktime. The driver keeps its own copy instead.
+/* The file is gone and its worker has finished. Retry only the recorded
+ * cleanup; teardown still requires confirmed firmware and hardware stop.
+ * Called under the video device mutex before creating another file context.
  */
-static u64 frame_timestamp(struct vdec_ctx *c)
+static int recover_released_session(struct vdec_dev *d)
 {
-	return pop_source_timestamp(c);
+	struct vdec_ctx *c = READ_ONCE(d->ctx);
+	int ret;
+
+	if (!c || !c->released)
+		return 0;
+	ret = session_stop(c);
+	if (ret)
+		return ret;
+	kfree(c);
+	return 0;
 }
 
 static int collect_events(struct vdec_ctx *c)
@@ -529,7 +504,12 @@ static int collect_events(struct vdec_ctx *c)
 			       c->pending_count, i);
 			return -EOVERFLOW;
 		}
-		u64 timestamp = frame_timestamp(c);
+		/* DISPLAY carries the timestamp of this picture, after firmware
+		 * reordering. A submission FIFO attaches a future reference's PTS
+		 * to a B picture. Preserve zero, duplicates and discontinuities:
+		 * timestamps are caller metadata, not a sort key or a clock.
+		 */
+		u64 timestamp = event.timestamp;
 
 		c->surfaces[i].pending = true;
 		c->pending[(c->pending_read + c->pending_count++) % DEC_SURFACES] =
@@ -816,20 +796,24 @@ static int res_change_restart(struct vdec_ctx *c, struct vb2_v4l2_buffer *src)
 
 static int allocate_surfaces(struct vdec_ctx *c)
 {
-	unsigned int i, j;
+	size_t bytes = (size_t)c->pic.size[0] + c->pic.size[1];
+	unsigned int i;
 	int ret;
 
 	c->pool_count = c->pic.dpb + 3;
 	if (c->pool_count > DEC_SURFACES ||
-	    (u64)c->pool_count * (c->pic.size[0] + c->pic.size[1]) > SZ_256M)
+	    (u64)c->pool_count * bytes > SZ_256M)
 		return -E2BIG;
 	for (i = 0; i < c->pool_count; i++) {
-		for (j = 0; j < 2; j++) {
-			ret = codec_alloc(c, 1, c->pic.size[j], &c->surfaces[i].plane[j]);
-			if (ret)
-				return ret;
-		}
-		c->surfaces[i].free = true;
+		struct vdec_surface *s = &c->surfaces[i];
+
+		ret = codec_alloc(c, 1, bytes, &s->plane[0]);
+		if (ret)
+			return ret;
+		s->plane[1].cpu = s->plane[0].cpu + c->pic.size[0];
+		s->plane[1].dma = s->plane[0].dma + c->pic.size[0];
+		s->plane[1].size = c->pic.size[1];
+		s->free = true;
 	}
 	return 0;
 }
@@ -874,15 +858,21 @@ static int submit_source(struct vdec_ctx *c, struct vb2_v4l2_buffer *src, u32 *c
 	struct vb2_plane *p = &src->vb2_buf.planes[0];
 	void *data = vb2_plane_vaddr(&src->vb2_buf, 0);
 	u32 bytes = p->bytesused - p->data_offset;
+	int ret;
 
-	/* A start code plus a NAL header is the smallest valid submission;
-	 * shorter units wedge xaga firmware instead of failing cleanly. The
-	 * bitstream mapping is checked as well, so a session that could not
-	 * allocate it can never be submitted to.
+	/* Annex B needs a start code and NAL header; VP9 may carry a one-byte
+	 * show_existing_frame. Both queue-time and DMA snapshot guards apply.
 	 */
-	if (!data || !c->bs.cpu || bytes < 4 || bytes > c->bs.size)
+	if (!data || !c->bs.cpu || !bytes || bytes > c->bs.size ||
+	    (bytes < 4 && c->src_fmt.pixelformat != V4L2_PIX_FMT_VP9))
 		return -EINVAL;
 	memcpy(c->bs.cpu, data + p->data_offset, bytes);
+	/* Check the exact DMA copy as well as QBUF: a userspace mapping must
+	 * not be able to change the SPS after the queue-time validation.
+	 */
+	ret = vcp_vdec_bitstream_guard(c->src_fmt.pixelformat, c->bs.cpu, bytes);
+	if (ret)
+		return ret;
 	c->source_cookie = ++c->next_cookie;
 	c->source_done = false;
 	VCPDBG("submit: bytes=%u offset=%u cookie=%#llx\n", bytes,
@@ -1056,10 +1046,6 @@ static void decode_work(struct work_struct *work)
 				}
 				goto finish;
 			}
-			/* The access unit is decoded from here on, so this is the
-			 * timestamp the picture it produces carries.
-			 */
-			push_source_timestamp(c, src->vb2_buf.timestamp);
 		}
 		deadline = jiffies + msecs_to_jiffies(5000);
 		while (!c->source_done) {
@@ -1227,6 +1213,7 @@ static int buffer_prepare(struct vb2_buffer *vb)
 	struct vdec_ctx *c = vb2_get_drv_priv(vb->vb2_queue);
 	struct v4l2_pix_format_mplane *f = queue_format(c, vb->type);
 	unsigned int i;
+	int ret;
 
 	for (i = 0; i < f->num_planes; i++) {
 		u32 need = f->plane_fmt[i].sizeimage;
@@ -1251,9 +1238,22 @@ static int buffer_prepare(struct vb2_buffer *vb)
 	}
 	if (is_output(vb->type) &&
 	    (vb->planes[0].data_offset > vb2_get_plane_payload(vb, 0) ||
-	     vb2_get_plane_payload(vb, 0) > vb2_plane_size(vb, 0))) {
+	     vb2_get_plane_payload(vb, 0) > vb2_plane_size(vb, 0) ||
+	     vb2_get_plane_payload(vb, 0) - vb->planes[0].data_offset <
+	     (c->src_fmt.pixelformat == V4L2_PIX_FMT_VP9 ? 1 : 4))) {
 		VCPDBG("prepare: output buf %u bad offset/payload\n", vb->index);
 		return -EINVAL;
+	}
+	if (is_output(vb->type)) {
+		const u8 *data = vb2_plane_vaddr(vb, 0);
+
+		if (!data)
+			return -EINVAL;
+		ret = vcp_vdec_bitstream_guard(f->pixelformat,
+				data + vb->planes[0].data_offset,
+				vb2_get_plane_payload(vb, 0) - vb->planes[0].data_offset);
+		if (ret)
+			return ret;
 	}
 	VCPDBG("prepare: %s buf %u ok, %ux%u planes=%u\n",
 	       is_output(vb->type) ? "output" : "capture", vb->index,
@@ -1311,17 +1311,22 @@ static int resume_streaming(struct vdec_ctx *c)
 static int start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct vdec_ctx *c = vb2_get_drv_priv(q);
+	struct vb2_v4l2_buffer *vb;
 	int ret;
 
 	VCPDBG("start_streaming: %s count=%u\n",
 	       is_output(q->type) ? "output" : "capture", count);
-	if (c->orphan) {
-		VCPDBG("start_streaming: orphan session refused\n");
-		return -EIO;
+	/* CAPTURE restart must not revive a failed firmware session. OUTPUT
+	 * STREAMOFF tears it down; only then may OUTPUT start clear the fault.
+	 */
+	if (c->orphan || (READ_ONCE(c->failed) &&
+			  (!is_output(q->type) || c->decoder))) {
+		ret = -EIO;
+		goto return_buffers;
 	}
 	WRITE_ONCE(c->stopping, false);
-	WRITE_ONCE(c->failed, false);
 	if (is_output(q->type)) {
+		WRITE_ONCE(c->failed, false);
 		c->draining = false;
 		c->drained = false;
 		c->submitted = false;
@@ -1338,13 +1343,21 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
 	ret = resume_streaming(c);
 	if (ret) {
 		VCPDBG("start_streaming: resume failed: %d\n", ret);
-		return ret;
+		WRITE_ONCE(c->failed, true);
+		goto return_buffers;
 	}
 	c->draining = false;
 	c->drained = false;
 	v4l2_m2m_clear_state(c->fh.m2m_ctx);
 	vdec_state(c, "start_streaming/capture");
 	return 0;
+return_buffers:
+	/* vb2 requires every buffer handed to a failed STREAMON back. */
+	while ((vb = is_output(q->type) ?
+		v4l2_m2m_src_buf_remove(c->fh.m2m_ctx) :
+		v4l2_m2m_dst_buf_remove(c->fh.m2m_ctx)))
+		v4l2_m2m_buf_done(vb, VB2_BUF_STATE_QUEUED);
+	return ret;
 }
 static void stop_streaming(struct vb2_queue *q)
 {
@@ -1477,11 +1490,11 @@ static int try_format(struct file *file, void *priv, struct v4l2_format *f)
 	if (is_output(f->type)) {
 		const struct vdec_codec *k;
 
-		if (!p->pixelformat)
-			p->pixelformat = V4L2_PIX_FMT_H264;
 		k = vdec_codec_by_fourcc(p->pixelformat);
-		if (!k)
-			return -EINVAL;
+		if (!k) {
+			k = &vdec_codecs[0];
+			p->pixelformat = k->fourcc;
+		}
 		p->width = vdec_dimension(p->width, k->size.min_width,
 					  k->size.max_width, k->size.step_width);
 		p->height = vdec_dimension(p->height, k->size.min_height,
@@ -1598,6 +1611,8 @@ static int decoder_cmd(struct file *file, void *priv, struct v4l2_decoder_cmd *c
 	VCPDBG("decoder_cmd: cmd=%u\n", cmd->cmd);
 	if (ret)
 		return ret;
+	if (READ_ONCE(c->failed) || c->orphan)
+		return -EIO;
 	if (cmd->cmd == V4L2_DEC_CMD_STOP) {
 		c->draining = true;
 		vdec_state(c, "decoder_cmd/stop");
@@ -1649,6 +1664,9 @@ static int vdec_open(struct file *file)
 
 	if (mutex_lock_interruptible(&d->lock))
 		return -ERESTARTSYS;
+	ret = recover_released_session(d);
+	if (ret)
+		goto unlock;
 	c = kzalloc_obj(*c);
 	if (!c) {
 		ret = -ENOMEM;
@@ -1717,6 +1735,8 @@ static int vdec_release(struct file *file)
 	v4l2_fh_exit(&c->fh);
 	if (!c->orphan)
 		kfree(c);
+	else
+		c->released = true;
 	mutex_unlock(&d->lock);
 	VCPDBG("release: done\n");
 	return 0;

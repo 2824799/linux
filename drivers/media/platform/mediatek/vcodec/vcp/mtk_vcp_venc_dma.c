@@ -161,6 +161,77 @@ fail:
 	return ERR_PTR(ret);
 }
 
+/* Copy only image samples. Prefixes, row padding, extra coded rows and guard
+ * bytes are never read from the user's allocation or left uninitialized.
+ */
+struct vcp_venc_dma_buffer *vcp_venc_dma_stage_input(struct device *dev,
+	struct vb2_buffer *vb, const struct vcp_venc_input_layout *layout)
+{
+	struct vcp_venc_dma_buffer *buffer;
+	unsigned int i, j, row;
+	int ret, end;
+
+	if (!layout || !vb || vb->num_planes != layout->planes)
+		return ERR_PTR(-EINVAL);
+	for (i = 0; i < vb->num_planes; i++) {
+		struct vb2_plane *p = &vb->planes[i];
+
+		if (p->bytesused > p->length || p->data_offset >= p->bytesused ||
+		    layout->src_size[i] > p->bytesused - p->data_offset)
+			return ERR_PTR(-EINVAL);
+	}
+	buffer = venc_dma_import(dev, vb, DMA_TO_DEVICE);
+	if (IS_ERR(buffer))
+		return buffer;
+	for (i = 0; i < buffer->planes; i++) {
+		struct vcp_venc_dma_plane *p = &buffer->plane[i];
+		struct iosys_map map = {};
+		u32 offset = p->offset;
+
+		p->size = layout->dst_size[i];
+		p->offset = 0;
+		p->staging = dma_alloc_coherent(dev, p->size, &p->staging_dma,
+						GFP_KERNEL);
+		if (!p->staging) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+		if (p->staging_dma >= BIT_ULL(34) ||
+		    p->size > BIT_ULL(34) - p->staging_dma) {
+			ret = -ERANGE;
+			goto fail;
+		}
+		p->address = p->staging_dma;
+		memset(p->staging, 0, p->size);
+		ret = dma_buf_begin_cpu_access(p->dbuf, DMA_BIDIRECTIONAL);
+		if (ret)
+			goto fail;
+		ret = dma_buf_vmap_unlocked(p->dbuf, &map);
+		if (!ret) {
+			for (j = 0; j < layout->components; j++) {
+				const struct vcp_venc_component *c = &layout->component[j];
+
+				if (c->plane != i)
+					continue;
+				for (row = 0; row < c->rows; row++)
+					iosys_map_memcpy_from(p->staging + c->dst_offset +
+							      row * c->stride, &map,
+							      offset + c->src_offset +
+							      row * c->stride, c->row_bytes);
+			}
+			dma_buf_vunmap_unlocked(p->dbuf, &map);
+		}
+		end = dma_buf_end_cpu_access(p->dbuf, DMA_BIDIRECTIONAL);
+		ret = ret ?: end;
+		if (ret)
+			goto fail;
+	}
+	return buffer;
+fail:
+	vcp_venc_dma_release(buffer);
+	return ERR_PTR(ret);
+}
+
 int vcp_venc_dma_copy_output(struct vcp_venc_dma_buffer *buffer, u32 bytes)
 {
 	if (buffer->direction != DMA_FROM_DEVICE || buffer->planes != 1)

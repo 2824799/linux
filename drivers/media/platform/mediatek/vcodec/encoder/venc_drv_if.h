@@ -131,7 +131,7 @@ struct venc_done_result {
 
 extern const struct venc_common_if venc_h264_if;
 extern const struct venc_common_if venc_vp8_if;
-extern const struct venc_common_if venc_vcp_h264_if;
+extern const struct venc_common_if venc_vcp_encoder_if;
 
 /*
  * venc_if_init - Create the driver handle
@@ -174,6 +174,6 @@ int venc_if_encode(struct mtk_vcodec_enc_ctx *ctx,
 		   struct mtk_vcodec_mem *bs_buf,
 		   struct venc_done_result *result);
 
-void venc_vcp_h264_buffers_ready(struct mtk_vcodec_enc_dev *dev);
+void venc_vcp_encoder_buffers_ready(struct mtk_vcodec_enc_dev *dev);
 
 #endif /* _VENC_DRV_IF_H_ */

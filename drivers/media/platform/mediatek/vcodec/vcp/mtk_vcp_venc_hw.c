@@ -65,10 +65,9 @@ struct mtk_vcp_venc_hw {
 	 * names the step it actually needs.
 	 */
 	unsigned long max_uv;
-	/* A shutdown that did not complete leaves the cores possibly running. The
-	 * state is then uncertain forever: the step is never relaxed and no core
-	 * may be powered again.
-	 */
+	/* Acquired references and consumed puts still awaiting suspend. */
+	unsigned long pm_held, pm_pending;
+	bool pm_ref;
 	bool retained;
 	struct mutex lock;
 	void (*notify)(void *priv, u64 cookie);
@@ -197,6 +196,39 @@ static void venc_vote_idle(struct mtk_vcp_venc_hw *hw)
 	hw->active_uv = 0;
 }
 
+static int venc_pm_release(struct mtk_vcp_venc_hw *hw)
+{
+	int i, ret;
+
+	for (i = 2 * VENC_CORES - 1; i >= 0; i--) {
+		struct device *dev = i < VENC_CORES ? hw->core[i].domain :
+				    hw->core[i - VENC_CORES].larb;
+
+		if (hw->pm_held & BIT(i)) {
+			ret = pm_runtime_put_sync_suspend(dev);
+			hw->pm_held &= ~BIT(i);
+		} else if (hw->pm_pending & BIT(i)) {
+			ret = pm_runtime_suspend(dev);
+		} else {
+			continue;
+		}
+		if (ret < 0) {
+			hw->pm_pending |= BIT(i);
+			hw->retained = true;
+			dev_warn(hw->dev, "VENC PM resource %d suspend failed: %d; retaining resources\n",
+				 i, ret);
+			return ret;
+		}
+		hw->pm_pending &= ~BIT(i);
+	}
+	hw->retained = false;
+	if (hw->pm_ref) {
+		hw->pm_ref = false;
+		module_put(THIS_MODULE);
+	}
+	return 0;
+}
+
 static int venc_rails_on(struct mtk_vcp_venc_hw *hw)
 {
 	int domains = 0, larbs = 0, ret;
@@ -227,68 +259,42 @@ static int venc_rails_on(struct mtk_vcp_venc_hw *hw)
 	ret = venc_vote_apply(hw);
 	if (ret)
 		return ret;
+	__module_get(THIS_MODULE);
+	hw->pm_ref = true;
 	for (; domains < VENC_CORES; domains++) {
 		ret = pm_runtime_resume_and_get(hw->core[domains].domain);
 		if (ret < 0)
 			goto rollback;
+		hw->pm_held |= BIT(domains);
 	}
 	for (; larbs < VENC_CORES; larbs++) {
 		ret = pm_runtime_resume_and_get(hw->core[larbs].larb);
 		if (ret < 0)
 			goto rollback;
+		hw->pm_held |= BIT(VENC_CORES + larbs);
 	}
 	ret = clk_bulk_prepare_enable(VENC_CORES, hw->clocks);
 	if (ret)
 		goto rollback;
 	hw->powered = true;
-	__module_get(THIS_MODULE);
 	return 0;
 rollback:
-	while (larbs--)
-		pm_runtime_put_sync(hw->core[larbs].larb);
-	while (domains--)
-		pm_runtime_put_sync(hw->core[domains].domain);
+	venc_pm_release(hw);
 	return ret;
 }
 
 /* Called only after both engines are idle and both IRQs are synchronized. */
 static int venc_rails_off(struct mtk_vcp_venc_hw *hw)
 {
-	int i, ret, error = 0;
+	int ret;
 
-	if (!hw->powered) {
-		/* Nothing this driver powered is running, so the rail does not have
-		 * to keep serving this codec while it stays idle.
-		 */
-		venc_vote_idle(hw);
-		return 0;
+	if (hw->powered) {
+		clk_bulk_disable_unprepare(VENC_CORES, hw->clocks);
+		hw->powered = false;
 	}
-	clk_bulk_disable_unprepare(VENC_CORES, hw->clocks);
-	for (i = VENC_CORES - 1; i >= 0; i--) {
-		ret = pm_runtime_put_sync(hw->core[i].larb);
-		if (ret < 0) {
-			dev_warn(hw->dev, "LARB%u suspend failed: %d\n", i + 7, ret);
-			error = error ?: ret;
-		}
-	}
-	for (i = VENC_CORES - 1; i >= 0; i--) {
-		ret = pm_runtime_put_sync(hw->core[i].domain);
-		if (ret < 0) {
-			dev_warn(hw->dev, "VENC domain%u suspend failed: %d\n", i, ret);
-			error = error ?: ret;
-		}
-	}
-	hw->powered = false;
-	module_put(THIS_MODULE);
-	if (error) {
-		/* A domain that did not suspend may still be executing, so the
-		 * request is kept and further power-ups are refused.
-		 */
-		hw->retained = true;
-		dev_warn(hw->dev, "VENC shutdown incomplete: %d; retaining the %d uV VCORE request\n",
-			 error, hw->active_uv);
-		return error;
-	}
+	ret = venc_pm_release(hw);
+	if (ret)
+		return ret;
 	venc_vote_idle(hw);
 	return 0;
 }
@@ -599,7 +605,8 @@ bool mtk_vcp_venc_hw_idle(struct mtk_vcp_venc_hw *hw)
 	bool idle;
 
 	mutex_lock(&hw->lock);
-	idle = !hw->powered;
+	idle = !hw->powered && !hw->retained && !hw->pm_held &&
+	       !hw->pm_pending && !hw->core[0].owner && !hw->core[1].owner;
 	mutex_unlock(&hw->lock);
 	return idle;
 }
@@ -615,10 +622,8 @@ int mtk_vcp_venc_hw_quiesce(struct mtk_vcp_venc_hw *hw)
 		return -EBUSY;
 	mutex_lock(&hw->lock);
 	if (!hw->powered) {
-		/* The firmware is offline and no core is powered, so the rail does
-		 * not have to keep serving this codec while it stays idle.
-		 */
-		venc_vote_idle(hw);
+		/* Includes partial power-on rollback and failed suspend retries. */
+		ret = venc_rails_off(hw);
 		goto out;
 	}
 	for (i = 0; i < VENC_CORES; i++) {

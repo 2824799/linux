@@ -26,10 +26,18 @@ int venc_if_init(struct mtk_vcodec_enc_ctx *ctx, unsigned int fourcc)
 			return -EINVAL;
 		ctx->enc_if = &venc_vp8_if;
 		break;
+	case V4L2_PIX_FMT_HEVC:
+#if IS_ENABLED(CONFIG_VIDEO_MEDIATEK_VCODEC_VCP)
+		if (ctx->dev->venc_pdata->uses_vcp) {
+			ctx->enc_if = &venc_vcp_encoder_if;
+			break;
+		}
+#endif
+		return -EINVAL;
 	case V4L2_PIX_FMT_H264:
 #if IS_ENABLED(CONFIG_VIDEO_MEDIATEK_VCODEC_VCP)
 		if (ctx->dev->venc_pdata->uses_vcp) {
-			ctx->enc_if = &venc_vcp_h264_if;
+			ctx->enc_if = &venc_vcp_encoder_if;
 			break;
 		}
 #else

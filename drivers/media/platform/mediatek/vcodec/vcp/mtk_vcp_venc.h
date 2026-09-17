@@ -7,6 +7,7 @@
 struct mtk_vcp_venc;
 struct mtk_vcp_venc_inst;
 struct vb2_buffer;
+struct vcp_venc_input_layout;
 struct vcp_venc_video_format;
 struct vcp_venc_frame_sizes;
 
@@ -95,6 +96,8 @@ struct mtk_vcp_venc *mtk_vcp_venc_create(struct device *dev,
 int mtk_vcp_venc_destroy(struct mtk_vcp_venc *enc);
 struct mtk_vcp_venc_inst *mtk_vcp_venc_new(struct mtk_vcp_venc *enc);
 u64 mtk_vcp_venc_cookie(struct mtk_vcp_venc_inst *inst);
+/* Select the CHECK_ID response before INIT; immutable while initialized. */
+int mtk_vcp_venc_set_codec(struct mtk_vcp_venc_inst *inst, u32 fourcc);
 int mtk_vcp_venc_init(struct mtk_vcp_venc_inst *inst);
 int mtk_vcp_venc_query(struct mtk_vcp_venc_inst *inst, u32 id,
 		       void *output, size_t size);
@@ -121,6 +124,7 @@ int mtk_vcp_venc_submit(struct mtk_vcp_venc_inst *inst, unsigned int mode,
  */
 int mtk_vcp_venc_submit_vb2(struct mtk_vcp_venc_inst *inst, unsigned int mode,
 	struct vb2_buffer *source, struct vb2_buffer *destination,
+	const struct vcp_venc_input_layout *layout,
 	struct vcp_venc_buffer_ids *ids);
 int mtk_vcp_venc_dequeue(struct mtk_vcp_venc_inst *inst,
 			 struct vcp_venc_result *result);

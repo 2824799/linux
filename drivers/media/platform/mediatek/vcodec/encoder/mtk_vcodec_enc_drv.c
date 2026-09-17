@@ -142,7 +142,7 @@ static const struct mtk_video_fmt mtk_video_formats_output[] = {
 	{
 		.fourcc = V4L2_PIX_FMT_P010,
 		.type = MTK_FMT_FRAME,
-		.num_planes = 2,
+		.num_planes = 1,
 	},
 };
 
@@ -184,7 +184,7 @@ static void mtk_vcodec_vcp_done_worker(struct work_struct *work)
 	 * current session so a coalesced stale notification cannot hide a newer
 	 * session's completion behind a single saved instance cookie.
 	 */
-	venc_vcp_h264_buffers_ready(dev);
+	venc_vcp_encoder_buffers_ready(dev);
 	mutex_unlock(&dev->enc_mutex);
 }
 #endif /* CONFIG_VIDEO_MEDIATEK_VCODEC_VCP */
@@ -284,7 +284,7 @@ static int fops_vcodec_open(struct file *file)
 	ctx->empty_flush_buf.vb.vb2_buf.vb2_queue = src_vq;
 	mtk_vcodec_enc_set_default_params(ctx);
 
-	/* VCP boots in venc_vcp_h264_if.init, never during udev probing. */
+	/* VCP boots in venc_vcp_encoder_if.init, never during udev probing. */
 	if (!dev->venc_pdata->uses_vcp && v4l2_fh_is_singular(&ctx->fh)) {
 		/*
 		 * load fireware to checks if it was loaded already and
@@ -648,11 +648,16 @@ static const struct mtk_vcodec_enc_pdata mt8195_pdata = {
 };
 
 #if IS_ENABLED(CONFIG_VIDEO_MEDIATEK_VCODEC_VCP)
+static const struct mtk_video_fmt mtk_video_formats_capture_vcp[] = {
+	{ .fourcc = V4L2_PIX_FMT_H264, .type = MTK_FMT_ENC, .num_planes = 1 },
+	{ .fourcc = V4L2_PIX_FMT_HEVC, .type = MTK_FMT_ENC, .num_planes = 1 },
+};
+
 static const struct mtk_vcodec_enc_pdata mt6895_pdata = {
 	.uses_vcp = true,
 	.uses_34bit = true,
-	.capture_formats = mtk_video_formats_capture_h264,
-	.num_capture_formats = ARRAY_SIZE(mtk_video_formats_capture_h264),
+	.capture_formats = mtk_video_formats_capture_vcp,
+	.num_capture_formats = ARRAY_SIZE(mtk_video_formats_capture_vcp),
 	.output_formats = mtk_video_formats_output,
 	.num_output_formats = ARRAY_SIZE(mtk_video_formats_output),
 	.min_bitrate = 64,

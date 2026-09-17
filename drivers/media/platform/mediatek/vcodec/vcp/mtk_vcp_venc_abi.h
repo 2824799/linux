@@ -7,6 +7,7 @@
 #include "mtk_vcp_venc.h"
 
 #define VCP_CODEC_H264_ENCODER 13
+#define VCP_CODEC_HEVC_ENCODER 14
 #define VCP_VENC_MAX_CAPS 64
 
 /* Vendor venc_ipi_msg.h: do not depend on frontend enum ordering. */
