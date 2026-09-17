@@ -30,7 +30,9 @@ MODULE_PARM_DESC(caps_dump, "dump the firmware decoder capability tables on sess
  * VP9 profile 0 uses the same MM21 conversion, but firmware writes chroma
  * immediately after luma regardless of the separate chroma address. Each
  * surface therefore owns one contiguous Y+UV allocation for every codec.
- * VP8 uses synchronous bitstream/frame submission; AV1 is unverified.
+ * VP8 and the MPEG family use synchronous bitstream/frame submission; the
+ * size boxes below are the firmware FRAME_SIZES table verbatim
+ * (HEIF 16383x16383 stills stay memory-gated by the surface allocator).
  */
 struct vdec_codec {
 	u32 fourcc;
@@ -47,7 +49,20 @@ static const struct vdec_codec vdec_codecs[] = {
 	{ V4L2_PIX_FMT_VP9, v4l2_fourcc('V', 'P', '9', '0'), VCP_VDEC_VP9,
 	  { 16, 4096, 16, 16, 2176, 16 } },
 	{ V4L2_PIX_FMT_VP8, v4l2_fourcc('V', 'P', '8', '0'), VCP_VDEC_VP8,
-	  { 16, 4096, 16, 16, 2176, 16 } },
+	  { 16, 2048, 16, 16, 1088, 32 } },
+	{ V4L2_PIX_FMT_MPEG2, v4l2_fourcc('M', 'P', 'G', '2'), VCP_VDEC_MPEG12,
+	  { 16, 2048, 16, 16, 1088, 32 } },
+	{ V4L2_PIX_FMT_MPEG4, v4l2_fourcc('M', 'P', 'G', '4'), VCP_VDEC_MPEG4,
+	  { 16, 2048, 16, 16, 1088, 32 } },
+	{ V4L2_PIX_FMT_H263, v4l2_fourcc('H', '2', '6', '3'), VCP_VDEC_H263,
+	  { 16, 1408, 16, 16, 1152, 32 } },
+	/* Upstream V4L2 spells AV1 'AV01' while the firmware table spells it
+	 * 'AV10'; the vcp_fourcc column carries the firmware spelling.
+	 */
+	{ V4L2_PIX_FMT_AV1, v4l2_fourcc('A', 'V', '1', '0'), VCP_VDEC_AV1,
+	  { 16, 4096, 16, 16, 2176, 32 } },
+	{ V4L2_PIX_FMT_HEIF, v4l2_fourcc('H', 'E', 'I', 'F'), VCP_VDEC_HEIF,
+	  { 16, 16383, 64, 16, 16383, 64 } },
 };
 
 static const struct vdec_codec *vdec_codec_by_fourcc(u32 fourcc)
