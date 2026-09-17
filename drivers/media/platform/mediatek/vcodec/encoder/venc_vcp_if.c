@@ -284,13 +284,18 @@ static int vcp_encoder_fill_color(const struct mtk_vcodec_enc_ctx *ctx,
 	return 0;
 }
 
+/* MPEG4-Part2 and H.263 have confirmed codec IDs, but this firmware build
+ * NACKs their INIT, so the exposure gate keeps those fourccs out and no
+ * per-codec branch exists below. See ENCODER-EXPANSION.md for the evidence
+ * and what re-enabling takes.
+ */
 static int vcp_encoder_set_param(void *handle, enum venc_set_param_type type,
 				      struct venc_enc_param *p)
 {
 	struct vcp_encoder_handle *h = handle;
 	struct vcp_venc_config config = {};
 	u32 sizes[VCP_VENC_PLANES] = {};
-	u32 id, value = 0;
+	u32 id, value = 0, dst_fourcc;
 	size_t count = 1;
 	bool synchronous;
 	struct mtk_q_data *q;
@@ -356,30 +361,81 @@ static int vcp_encoder_set_param(void *handle, enum venc_set_param_type type,
 				   q->coded_height, &h->input_layout);
 	if (ret)
 		return ret;
+	dst_fourcc = h->ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc;
+	/* Verified encode boxes (visible geometry). H.264 corrupts past
+	 * 4096 macroblock columns on this firmware; HEVC cannot allocate
+	 * at 4096 and up; HEIF stills share the HEVC box. SRC negotiation
+	 * cannot know the DST codec, so this is the deterministic gate.
+	 */
+	{
+		unsigned int max_w, max_h;
+
+		switch (dst_fourcc) {
+		case V4L2_PIX_FMT_H264:
+			max_w = 4096; max_h = 4320;
+			break;
+		case V4L2_PIX_FMT_HEVC:
+		case v4l2_fourcc('H', 'E', 'I', 'F'):
+			max_w = 3840; max_h = 2160;
+			break;
+		default:
+			return -EINVAL;
+		}
+		if (q->visible_width > max_w || q->visible_height > max_h)
+			return -EINVAL;
+	}
 	/* Despite its name this vendor field contains venc_yuv_fmt, not FourCC. */
 	config.input_fourcc = cpu_to_le32(p->input_yuv_fmt);
 	config.bitrate = cpu_to_le32(p->bitrate);
-	config.bitratemode = cpu_to_le32(V4L2_MPEG_VIDEO_BITRATE_MODE_CBR);
+	/* Vendor passes the V4L2 bitrate-mode enum straight through; only the
+	 * modes with verified behavior are accepted, CQ is not.
+	 */
+	if (p->bitrate_mode != V4L2_MPEG_VIDEO_BITRATE_MODE_CBR &&
+	    p->bitrate_mode != V4L2_MPEG_VIDEO_BITRATE_MODE_VBR)
+		return -EINVAL;
+	config.bitratemode = cpu_to_le32(p->bitrate_mode);
 	config.pic_w = cpu_to_le32(q->visible_width);
 	config.pic_h = cpu_to_le32(q->visible_height);
 	config.buf_w = cpu_to_le32(h->input_layout.buf_width);
 	config.buf_h = cpu_to_le32(h->input_layout.buf_height);
 	config.gop_size = cpu_to_le32(p->gop_size);
-	config.intra_period = cpu_to_le32(p->intra_period);
+	/* Firmware emits an IDR every frame when intra_period is 0, which
+	 * also makes B-frames and rate-control measurements meaningless
+	 * (every historical default-config encode was all-IDR). V4L2 leaves
+	 * 0 as "unspecified" here, so follow the GOP interval instead; the
+	 * control value itself is untouched for readback. Verified: GOP=15
+	 * default then yields periodic IDRs, IPERIOD=60 gives 1 IDR + 59 P.
+	 */
+	config.intra_period = cpu_to_le32(p->intra_period ?
+					  p->intra_period : p->gop_size);
 	config.framerate = cpu_to_le32(p->frm_rate);
 	config.profile = cpu_to_le32(p->h264_profile);
 	config.level = cpu_to_le32(p->h264_level);
-	config.num_b_frame = cpu_to_le32(0);
+	/* B-frames reorder in firmware; single stills cannot use them.
+	 * Timestamp restore is by completion cookie, not by queue order,
+	 * so reordered completions keep their own PTS.
+	 */
+	if (dst_fourcc == v4l2_fourcc('H', 'E', 'I', 'F')) {
+		if (p->num_b_frame)
+			return -EINVAL;
+	} else if (p->num_b_frame > 2) {
+		return -EINVAL;
+	}
+	config.num_b_frame = cpu_to_le32(p->num_b_frame);
 	config.max_qp = cpu_to_le32(h->ctx->enc_params.h264_max_qp);
 	/* P010 is the only 10-bit input with a V4L2 mapping; MT10 tile mode
 	 * has no userspace layout, so it is never advertised or accepted.
 	 */
 	ten_bit = (p->input_yuv_fmt == VENC_YUV_FORMAT_P010);
-	if (h->ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_HEVC) {
+	if (dst_fourcc == V4L2_PIX_FMT_HEVC ||
+	    dst_fourcc == v4l2_fourcc('H', 'E', 'I', 'F')) {
 		const struct mtk_enc_params *params = &h->ctx->enc_params;
 		bool main10 = params->hevc_profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10;
 
-		/* Profile and level are firmware values, not V4L2 enum ordinals. */
+		/* Profile and level are firmware values, not V4L2 enum ordinals.
+		 * HEIF stills share the HEVC profile/level mapping; the still
+		 * bitstream is one coded picture per submitted frame.
+		 */
 		if ((!main10 && params->hevc_profile != V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN) ||
 		    params->hevc_level > V4L2_MPEG_VIDEO_HEVC_LEVEL_6_2 ||
 		    params->hevc_tier > V4L2_MPEG_VIDEO_HEVC_TIER_HIGH ||
@@ -391,7 +447,14 @@ static int vcp_encoder_set_param(void *handle, enum venc_set_param_type type,
 		config.profile = cpu_to_le32(main10 ? 4 : 2);
 		config.level = cpu_to_le32(ret);
 		config.max_qp = cpu_to_le32(params->hevc_max_qp);
+		if (dst_fourcc == v4l2_fourcc('H', 'E', 'I', 'F'))
+			config.heif_grid_size = cpu_to_le32(p->heif_grid_size);
 	}
+	/* MPEG4-Part2 and H.263 have confirmed codec IDs, but this firmware
+	 * build NACKs their INIT, so the exposure gate keeps those fourccs
+	 * out and no per-codec branch exists here. See ENCODER-EXPANSION.md
+	 * for the evidence and the vendor mapping tables to restore.
+	 */
 	ret = vcp_encoder_fill_color(h->ctx, ten_bit, config.color_desc);
 	if (ret)
 		return ret;
@@ -423,7 +486,16 @@ static int vcp_encoder_set_param(void *handle, enum venc_set_param_type type,
 	 * while serializing frontend jobs until each completion ring item has
 	 * been consumed.
 	 */
-	h->serialized = true;
+	/* B-frame reorder delay requires multiple frames in flight: the
+	 * firmware holds reference inputs across submits and completes out
+	 * of order, so a strictly serialized frontend deadlocks after the
+	 * first completion (verified: 1/7 returned, then -ETIMEDOUT).
+	 * Firmware advertises async operation and accepts pipelined
+	 * submits; completions are matched by cookie, restoring each
+	 * picture's own timestamp. Sessions without B-frames stay
+	 * serialized, preserving all previously validated behavior.
+	 */
+	h->serialized = !p->num_b_frame;
 	h->configured = true;
 	return 0;
 
@@ -501,6 +573,12 @@ static int vcp_encoder_encode(void *handle, enum venc_start_opt opt,
 	}
 	deadline = jiffies + msecs_to_jiffies(2000);
 	if (opt == VENC_START_OPT_ENCODE_FRAME_FINAL) {
+		/* Trailing B-frame references release seconds after EOS on
+		 * this firmware (3 s linger verified for 640x480x60); a
+		 * 2 s drain budget turns healthy drains into ETIMEDOUT.
+		 * Normal submits keep the 2 s budget below.
+		 */
+		deadline = jiffies + msecs_to_jiffies(10000);
 		for (;;) {
 			unsigned long seq = READ_ONCE(h->dev->vcp_notify_seq);
 			long left;

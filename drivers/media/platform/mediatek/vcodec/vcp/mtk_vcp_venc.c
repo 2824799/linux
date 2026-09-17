@@ -555,6 +555,18 @@ int mtk_vcp_venc_set_codec(struct mtk_vcp_venc_inst *inst, u32 fourcc)
 	case V4L2_PIX_FMT_HEVC:
 		id = VCP_CODEC_HEVC_ENCODER;
 		break;
+	case V4L2_PIX_FMT_MPEG4:
+		id = VCP_CODEC_MPEG4_ENCODER;
+		break;
+	case V4L2_PIX_FMT_H263:
+		id = VCP_CODEC_H263_ENCODER;
+		break;
+	/* V4L2_PIX_FMT_HEIF, defined in venc_drv_if.h; spelled out here so
+	 * the protocol layer keeps no frontend dependency.
+	 */
+	case v4l2_fourcc('H', 'E', 'I', 'F'):
+		id = VCP_CODEC_HEIF_ENCODER;
+		break;
 	default:
 		return -EINVAL;
 	}

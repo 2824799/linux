@@ -78,6 +78,9 @@ enum mtk_encode_param {
  * @hevc_level: V4L2 HEVC level
  * @hevc_tier: V4L2 HEVC tier
  * @hevc_max_qp: Maximum HEVC quantization parameter
+ * @bitrate_mode: V4L2 bitrate mode (CBR or VBR)
+ * @heif_grid_size: packed HEIF grid, 0 for untiled single stills
+ * @num_b_frame: B-frames between reference frames (0..2; stills force 0)
  * @color_desc: validated MTK color description, 17 u32 in vendor wire order
  * @color_desc_set: whether userspace supplied @color_desc for this session
  * @force_intra: force/insert intra frame
@@ -96,6 +99,11 @@ struct mtk_enc_params {
 	unsigned int	h264_profile;
 	unsigned int	h264_level;
 	unsigned int	hevc_profile, hevc_level, hevc_tier, hevc_max_qp;
+	unsigned int	bitrate_mode;
+	/* Packed (width<<16)|height grid for HEIF tiled stills, 0 for a
+	 * single untiled picture. Same packing as vendor GRID_SIZE.
+	 */
+	unsigned int	heif_grid_size;
 	u32		color_desc[17];
 	bool		color_desc_set;
 	unsigned int	force_intra;

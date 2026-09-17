@@ -11,6 +11,12 @@
 
 #include "mtk_vcodec_enc_drv.h"
 
+/* Upstream V4L2 has no HEIF fourcc; matches vendor V4L2_PIX_FMT_HEIF and the
+ * firmware caps entry 0x46494548. Single home for this macro: the protocol
+ * layer compares the same value via v4l2_fourcc('H', 'E', 'I', 'F').
+ */
+#define V4L2_PIX_FMT_HEIF v4l2_fourcc('H', 'E', 'I', 'F')
+
 /*
  * enum venc_yuv_fmt - The type of input yuv format
  * (VPU related: If you change the order, you must also update the VPU codes.)
@@ -94,7 +100,10 @@ struct venc_enc_param {
 	unsigned int frm_rate;
 	unsigned int intra_period;
 	unsigned int bitrate;
+	unsigned int bitrate_mode;
+	unsigned int num_b_frame;
 	unsigned int gop_size;
+	unsigned int heif_grid_size;
 };
 
 /**

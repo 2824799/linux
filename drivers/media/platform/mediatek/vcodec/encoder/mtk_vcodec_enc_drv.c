@@ -651,6 +651,12 @@ static const struct mtk_vcodec_enc_pdata mt8195_pdata = {
 static const struct mtk_video_fmt mtk_video_formats_capture_vcp[] = {
 	{ .fourcc = V4L2_PIX_FMT_H264, .type = MTK_FMT_ENC, .num_planes = 1 },
 	{ .fourcc = V4L2_PIX_FMT_HEVC, .type = MTK_FMT_ENC, .num_planes = 1 },
+	/* MPEG4-Part2 (0x11) and H.263 (0x13) codec IDs are confirmed by
+	 * firmware CHECK_ID, but this firmware build NACKs their INIT
+	 * (status=1, deterministic across sessions). Not exposed until a
+	 * firmware instantiates them; see ENCODER-EXPANSION.md.
+	 */
+	{ .fourcc = V4L2_PIX_FMT_HEIF, .type = MTK_FMT_ENC, .num_planes = 1 },
 };
 
 static const struct mtk_vcodec_enc_pdata mt6895_pdata = {

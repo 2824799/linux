@@ -20,11 +20,17 @@
 #define MTK_VENC_HD_MAX_H	1088U
 #define MTK_VENC_4K_MAX_W	3840U
 #define MTK_VENC_4K_MAX_H	2176U
-/* The VCP encoder firmware publishes its own limits through VCP_ENC_QUERY;
- * on MT6895 it accepts H.264 up to 7680x4320, well past the VPU tables.
+/* Verified encode boxes per codec (visible geometry). The firmware size
+ * table claims 7680x4320, but this build corrupts H.264 wider than 4096
+ * macroblock columns and cannot allocate HEVC at 4096 and up; HEIF stills
+ * share the HEVC box. SRC negotiation clamps to the widest verified
+ * width; ENUM reports per-codec boxes; SET_PARAM enforces them and fails
+ * closed beyond.
  */
-#define MTK_VENC_VCP_MAX_W	7680U
-#define MTK_VENC_VCP_MAX_H	4320U
+#define MTK_VENC_H264_MAX_W	4096U
+#define MTK_VENC_H264_MAX_H	4320U
+#define MTK_VENC_HEVC_MAX_W	3840U
+#define MTK_VENC_HEVC_MAX_H	2160U
 
 #define DFT_CFG_WIDTH	MTK_VENC_MIN_W
 #define DFT_CFG_HEIGHT	MTK_VENC_MIN_H
@@ -44,6 +50,9 @@
  */
 #define V4L2_CID_MPEG_MTK_COLOR_DESC	(V4L2_CTRL_CLASS_CODEC | 0x2007)
 #define MTK_COLOR_DESC_WORDS	17
+/* Vendor V4L2_CID_MPEG_MTK_ENCODE_GRID_SIZE is MTK_BASE+27. */
+#define V4L2_CID_MPEG_MTK_ENCODE_GRID_SIZE	(V4L2_CTRL_CLASS_CODEC | 0x201b)
+#define MTK_HEIF_GRID_MAX		((3840 << 16) + 2176)
 
 #define MTK_DEFAULT_FRAMERATE_NUM 1001
 #define MTK_DEFAULT_FRAMERATE_DENOM 30000
@@ -62,8 +71,13 @@ static const struct v4l2_frmsize_stepwise mtk_venc_4k_framesizes = {
 };
 
 static const struct v4l2_frmsize_stepwise mtk_venc_vcp_framesizes = {
-	MTK_VENC_MIN_W, MTK_VENC_VCP_MAX_W, 2,
-	MTK_VENC_MIN_H, MTK_VENC_VCP_MAX_H, 2,
+	MTK_VENC_MIN_W, MTK_VENC_H264_MAX_W, 2,
+	MTK_VENC_MIN_H, MTK_VENC_H264_MAX_H, 2,
+};
+
+static const struct v4l2_frmsize_stepwise mtk_venc_vcp_framesizes_hevc = {
+	MTK_VENC_MIN_W, MTK_VENC_HEVC_MAX_W, 2,
+	MTK_VENC_MIN_H, MTK_VENC_HEVC_MAX_H, 2,
 };
 
 /*
@@ -75,8 +89,8 @@ static void mtk_venc_max_size(struct mtk_vcodec_enc_ctx *ctx,
 			      unsigned int *max_w, unsigned int *max_h)
 {
 	if (ctx->dev->venc_pdata->uses_vcp) {
-		*max_w = MTK_VENC_VCP_MAX_W;
-		*max_h = MTK_VENC_VCP_MAX_H;
+		*max_w = MTK_VENC_H264_MAX_W;
+		*max_h = MTK_VENC_H264_MAX_H;
 	} else if (ctx->dev->enc_capability & MTK_VENC_4K_CAPABILITY_ENABLE) {
 		*max_w = MTK_VENC_4K_MAX_W;
 		*max_h = MTK_VENC_4K_MAX_H;
@@ -110,10 +124,17 @@ static int vidioc_venc_s_ctrl(struct v4l2_ctrl *ctrl)
 	switch (ctrl->id) {
 	case V4L2_CID_MPEG_VIDEO_BITRATE_MODE:
 		mtk_v4l2_venc_dbg(2, ctx, "V4L2_CID_MPEG_VIDEO_BITRATE_MODE val= %d", ctrl->val);
+		/* Only CBR is exposed: VBR reaches the firmware wire word
+		 * unchanged but encodes byte-identical output on mixed
+		 * content (verified), so advertising it would mislead.
+		 * See ENCODER-EXPANSION.md.
+		 */
 		if (ctrl->val != V4L2_MPEG_VIDEO_BITRATE_MODE_CBR) {
 			mtk_v4l2_venc_err(ctx, "Unsupported bitrate mode =%d", ctrl->val);
 			ret = -EINVAL;
+			break;
 		}
+		p->bitrate_mode = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_VIDEO_BITRATE:
 		mtk_v4l2_venc_dbg(2, ctx, "V4L2_CID_MPEG_VIDEO_BITRATE val = %d", ctrl->val);
@@ -160,6 +181,9 @@ static int vidioc_venc_s_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP:
 		p->hevc_max_qp = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_MTK_ENCODE_GRID_SIZE:
+		p->heif_grid_size = ctrl->val;
 		break;
 	case V4L2_CID_MPEG_MTK_COLOR_DESC: {
 		const u32 *desc = ctrl->p_new.p_u32;
@@ -263,9 +287,21 @@ static int vidioc_enum_framesizes(struct file *file, void *fh,
 
 	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 
-	if (ctx->dev->venc_pdata->uses_vcp)
-		fsize->stepwise = mtk_venc_vcp_framesizes;
-	else if (ctx->dev->enc_capability & MTK_VENC_4K_CAPABILITY_ENABLE)
+	if (ctx->dev->venc_pdata->uses_vcp) {
+		/* Coded formats report their verified boxes; raw formats
+		 * report the negotiation range (SET_PARAM still gates the
+		 * DST codec).
+		 */
+		switch (fmt->fourcc) {
+		case V4L2_PIX_FMT_HEVC:
+		case V4L2_PIX_FMT_HEIF:
+			fsize->stepwise = mtk_venc_vcp_framesizes_hevc;
+			break;
+		default:
+			fsize->stepwise = mtk_venc_vcp_framesizes;
+			break;
+		}
+	} else if (ctx->dev->enc_capability & MTK_VENC_4K_CAPABILITY_ENABLE)
 		fsize->stepwise = mtk_venc_4k_framesizes;
 	else
 		fsize->stepwise = mtk_venc_hd_framesizes;
@@ -533,6 +569,9 @@ static void mtk_venc_set_param(struct mtk_vcodec_enc_ctx *ctx,
 	}
 	param->h264_profile = enc_params->h264_profile;
 	param->h264_level = enc_params->h264_level;
+	param->bitrate_mode = enc_params->bitrate_mode;
+	param->num_b_frame = enc_params->num_b_frame;
+	param->heif_grid_size = enc_params->heif_grid_size;
 
 	/* Config visible resolution */
 	param->width = q_data_src->visible_width;
@@ -1085,7 +1124,8 @@ static int vb2ops_venc_start_streaming(struct vb2_queue *q, unsigned int count)
 	ctx->param_change = MTK_ENCODE_PARAM_NONE;
 
 	if ((ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_H264 ||
-	     ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_HEVC) &&
+	     ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_HEVC ||
+	     ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_HEIF) &&
 	    (ctx->enc_params.seq_hdr_mode !=
 				V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE)) {
 		ret = venc_if_set_param(ctx,
@@ -1457,10 +1497,23 @@ static void m2mops_venc_device_run(void *priv)
 	if (ret)
 		goto abort;
 
-	if ((ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_H264 ||
-	     ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_HEVC) &&
+	/* Only JOINED_WITH_1ST_FRAME is offered (see the control menu):
+	 * FFmpeg hardcodes SEPARATE yet emits the separate header as a
+	 * media packet, which breaks strict/container decode, while
+	 * in-band headers work for every client. The separate-header
+	 * emission below stays for a future SEPARATE mode; today the
+	 * firmware prepends headers in-band via PREPEND_HEADER.
+	 */
+	if (((ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_H264 ||
+	      ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_HEVC ||
+	      ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc == V4L2_PIX_FMT_HEIF)) &&
+	    ctx->enc_params.seq_hdr_mode ==
+				V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE &&
 	    (ctx->state != MTK_STATE_HEADER)) {
-		/* Emit the codec sequence header before the first picture. */
+		/* Emit the codec sequence header before the first picture:
+		 * SPS/PPS, VPS/SPS/PPS, or the still picture parameter sets
+		 * the container muxer places out of band.
+		 */
 		ret = mtk_venc_encode_header(ctx);
 		if (ret)
 			goto abort;
@@ -1588,6 +1641,10 @@ void mtk_vcodec_enc_set_default_params(struct mtk_vcodec_enc_ctx *ctx)
 		ctx->enc_params.framerate_num = MTK_DEFAULT_FRAMERATE_DENOM;
 		ctx->enc_params.framerate_denom = MTK_DEFAULT_FRAMERATE_NUM;
 	}
+	/* Mirror the control defaults so the firmware config never depends
+	 * on control-handler setup order; zero-init alone would read as VBR.
+	 */
+	ctx->enc_params.bitrate_mode = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;
 }
 
 int mtk_vcodec_enc_ctrls_setup(struct mtk_vcodec_enc_ctx *ctx)
@@ -1610,7 +1667,7 @@ int mtk_vcodec_enc_ctrls_setup(struct mtk_vcodec_enc_ctx *ctx)
 			  ctx->dev->venc_pdata->min_bitrate,
 			  ctx->dev->venc_pdata->max_bitrate, 1, 4000000);
 	v4l2_ctrl_new_std(handler, ops, V4L2_CID_MPEG_VIDEO_B_FRAMES,
-			0, vcp ? 0 : 2, 1, 0);
+			0, 2, 1, 0);
 	v4l2_ctrl_new_std(handler, ops, V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE,
 			vcp ? 1 : 0, 1, 1, 1);
 	v4l2_ctrl_new_std(handler, ops, V4L2_CID_MPEG_VIDEO_H264_MAX_QP,
@@ -1626,7 +1683,8 @@ int mtk_vcodec_enc_ctrls_setup(struct mtk_vcodec_enc_ctx *ctx)
 	v4l2_ctrl_new_std_menu(handler, ops,
 			V4L2_CID_MPEG_VIDEO_HEADER_MODE,
 			V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME,
-			0, V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE);
+			~(1 << V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME),
+			V4L2_MPEG_VIDEO_HEADER_MODE_JOINED_WITH_1ST_FRAME);
 	v4l2_ctrl_new_std_menu(handler, ops, V4L2_CID_MPEG_VIDEO_H264_PROFILE,
 			V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
 			~((1 << V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE) |
@@ -1668,6 +1726,20 @@ int mtk_vcodec_enc_ctrls_setup(struct mtk_vcodec_enc_ctx *ctx)
 		};
 
 		v4l2_ctrl_new_custom(handler, &color_desc_cfg, NULL);
+	}
+	if (vcp) {
+		struct v4l2_ctrl_config grid_cfg = {
+			.ops = ops,
+			.id = V4L2_CID_MPEG_MTK_ENCODE_GRID_SIZE,
+			.name = "Video encode heif grid size",
+			.type = V4L2_CTRL_TYPE_INTEGER,
+			.min = 0,
+			.max = MTK_HEIF_GRID_MAX,
+			.step = 1,
+			.def = 0,
+		};
+
+		v4l2_ctrl_new_custom(handler, &grid_cfg, NULL);
 	}
 	if (!vcp)
 		v4l2_ctrl_new_std_menu(handler, ops, V4L2_CID_MPEG_VIDEO_VP8_PROFILE,

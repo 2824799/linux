@@ -27,6 +27,7 @@ int venc_if_init(struct mtk_vcodec_enc_ctx *ctx, unsigned int fourcc)
 		ctx->enc_if = &venc_vp8_if;
 		break;
 	case V4L2_PIX_FMT_HEVC:
+	case V4L2_PIX_FMT_HEIF:
 #if IS_ENABLED(CONFIG_VIDEO_MEDIATEK_VCODEC_VCP)
 		if (ctx->dev->venc_pdata->uses_vcp) {
 			ctx->enc_if = &venc_vcp_encoder_if;

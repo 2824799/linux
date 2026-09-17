@@ -8,6 +8,18 @@
 
 #define VCP_CODEC_H264_ENCODER 13
 #define VCP_CODEC_HEVC_ENCODER 14
+/* Codec ids are vendor enum mtk_codec_type (mtk_vcodec_drv.h), shared with
+ * the decoder ABI: VENC_H264=13, VENC_H265=14, VENC_HEIF=15, VENC_VP8=16,
+ * VENC_MPEG4=17, VENC_HYBRID_H264=18, VENC_H263=19. Verified on xaga by
+ * observing the firmware CHECK_ID probe order 0x11,0x13,0xd,0xe,0xf and
+ * per-format INIT confirmation replies.
+ */
+#define VCP_CODEC_MPEG4_ENCODER 17
+#define VCP_CODEC_H263_ENCODER 19
+#define VCP_CODEC_HEIF_ENCODER 15
+static_assert(VCP_CODEC_MPEG4_ENCODER == 0x11);
+static_assert(VCP_CODEC_H263_ENCODER == 0x13);
+static_assert(VCP_CODEC_HEIF_ENCODER == 0xf);
 #define VCP_VENC_MAX_CAPS 64
 
 /* Vendor venc_ipi_msg.h: do not depend on frontend enum ordering. */
