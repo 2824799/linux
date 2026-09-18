@@ -537,7 +537,19 @@ static int collect_events(struct vdec_ctx *c)
 	return ret == -EAGAIN ? 0 : ret;
 }
 
-/* MM21: 16x32 luma tiles and 16x16 interleaved chroma tiles in raster order. */
+/* MM21: 16x32 luma tiles and 16x16 interleaved chroma tiles in raster order.
+ * MT2T luma: the same 16x32 grid at 10 bits per sample. Each 16x4 slab
+ * stores 16 LSB bytes then 64 MSB bytes; LSB byte k packs samples
+ * 4k..4k+3 low pairs at bits 1:0 through 7:6, MSB byte is value>>2.
+ * Columns of 4 are contiguous (sample k = row * 16 + col).
+ * MT2T chroma: U and V share one grid of 8x4 row-major groups. Group
+ * (gx, gy) covers columns 8 * (gx / 4)..+7 and rows 16 * gy + 4 * (gx % 4)
+ * ..+3 with the same geometry for U and V. Each 80-byte group stores 8
+ * U LSB bytes interleaved with 8 V LSB bytes ([U0 V0 U1 V1 ...]), then
+ * 32 U MSB bytes interleaved with 32 V MSB bytes; even bytes belong to U,
+ * odd bytes to V. Cell (i, j) is MSB index j * 8 + i and LSB pair
+ * k = j * 8 + i of its own plane.
+ */
 static void detile(void *destination, const void *source, u32 stride, u32 height, u32 tile_h)
 {
 	u32 x, y;
@@ -550,6 +562,78 @@ static void detile(void *destination, const void *source, u32 stride, u32 height
 		}
 }
 
+static void detile_10_chroma(__le16 *dst_uv, const u8 *source, u32 stride,
+			       u32 buffer_height)
+{
+	u32 wc = stride / 2, hc = buffer_height / 2;
+	u32 groups_per_row = wc / 2, slabs = hc / 16;
+	u32 s, gx;
+
+	for (s = 0; s < slabs; s++) {
+		for (gx = 0; gx < groups_per_row; gx += 4) {
+			u32 c0 = (gx / 4) * 8, r0 = s * 16;
+			unsigned int p, j, i;
+
+			if (c0 + 8 > wc || r0 + 16 > hc)
+				continue;
+			for (p = 0; p < 4; p++) {
+				const u8 *group =
+					source + (s * groups_per_row + gx + p) * 80;
+				u32 rr = r0 + p * 4;
+
+				for (j = 0; j < 4; j++) {
+					for (i = 0; i < 8; i++) {
+						unsigned int k = j * 8 + i;
+						u32 u = (u32)group[16 + 2 * k] << 2 |
+							((group[2 * (k / 4)] >>
+							  (2 * (k % 4))) & 3);
+						u32 v = (u32)group[17 + 2 * k] << 2 |
+							((group[2 * (k / 4) + 1] >>
+							  (2 * (k % 4))) & 3);
+						__le16 *cell = dst_uv +
+							(rr + j) * stride +
+							(c0 + i) * 2;
+
+						cell[0] = cpu_to_le16(u << 6);
+						cell[1] = cpu_to_le16(v << 6);
+					}
+				}
+			}
+		}
+	}
+}
+
+static void detile_10_plane(__le16 *destination, const u8 *source, u32 words,
+			    u32 xstep, u32 grid_w, u32 grid_h)
+{
+	u32 tx, ty, y;
+
+	for (ty = 0; ty < grid_h; ty += 32) {
+		for (tx = 0; tx < grid_w; tx += 16) {
+			const u8 *tile = source +
+				((ty / 32 * (grid_w / 16) + tx / 16) * 32 * 16 * 10 / 8);
+
+			for (y = 0; y < 32; y += 4) {
+				const u8 *lsb = tile + (y / 4 * 80);
+				const u8 *msb = lsb + 16;
+				unsigned int r, x;
+
+				for (r = 0; r < 4; r++) {
+					for (x = 0; x < 16; x++) {
+						unsigned int k = r * 16 + x;
+						u32 value = (u32)msb[k] << 2 |
+							((lsb[k / 4] >> (2 * (k % 4))) & 3);
+
+						destination[(ty + y + r) * words +
+							  (tx + x) * xstep] =
+							cpu_to_le16(value << 6);
+					}
+				}
+			}
+		}
+	}
+}
+
 /* A capture buffer can only receive the picture it was sized for. After a
  * midstream resolution change the queue still holds buffers of the previous
  * picture; writing the new one there runs past the end of the mapping.
@@ -558,6 +642,10 @@ static bool capture_fits(const struct vdec_ctx *c, struct vb2_v4l2_buffer *vb)
 {
 	u32 luma = c->pic.size[0], chroma = c->pic.size[1];
 
+	/* P010 output is larger than the MT2T tiles it is converted from. */
+	if (c->pic.fourcc == V4L2_PIX_FMT_MT2T)
+		return vb2_plane_size(&vb->vb2_buf, 0) >=
+			(size_t)c->pic.stride * c->pic.buffer_height * 3;
 	if (c->dst_fmt.num_planes == 1)
 		return vb2_plane_size(&vb->vb2_buf, 0) >= (size_t)luma + chroma;
 	return vb2_plane_size(&vb->vb2_buf, 0) >= luma &&
@@ -575,6 +663,28 @@ static int deliver_frames(struct vdec_ctx *c)
 		struct vdec_surface *s = &c->surfaces[p->surface];
 
 		v4l2_m2m_dst_buf_remove(c->fh.m2m_ctx);
+		if (c->pic.fourcc == V4L2_PIX_FMT_MT2T) {
+			/* 10-bit output as standard single-plane P010. Luma
+			 * detiles from plane 0; U and V share plane 1 with one
+			 * 8x4 row-major group per 80 bytes and land interleaved
+			 * in the P010 chroma plane.
+			 */
+			__le16 *base = vb2_plane_vaddr(&vb->vb2_buf, 0);
+			u32 stride = c->pic.stride, bh = c->pic.buffer_height;
+			size_t y_words = (size_t)stride * bh;
+			size_t total = (y_words + y_words / 2) * 2;
+
+			if (!base || vb2_plane_size(&vb->vb2_buf, 0) < total) {
+				v4l2_m2m_buf_done(vb, VB2_BUF_STATE_ERROR);
+				return -EFAULT;
+			}
+			dma_rmb();
+			detile_10_plane(base, s->plane[0].cpu, stride, 1, stride, bh);
+			detile_10_chroma(base + y_words, s->plane[1].cpu,
+					 stride, bh);
+			vb2_set_plane_payload(&vb->vb2_buf, 0, total);
+			goto delivered;
+		}
 		/* detile() writes a whole picture: a buffer queued for an
 		 * earlier resolution only fits part of it and must be handed
 		 * back instead of written past its end.
@@ -615,6 +725,7 @@ static int deliver_frames(struct vdec_ctx *c)
 			vb2_set_plane_payload(&vb->vb2_buf, 0, c->pic.size[0]);
 			vb2_set_plane_payload(&vb->vb2_buf, 1, c->pic.size[1]);
 		}
+delivered:
 		vb->vb2_buf.timestamp = p->timestamp;
 		vb->field = V4L2_FIELD_NONE;
 		vb->sequence = c->sequence++;
@@ -835,11 +946,14 @@ static int allocate_surfaces(struct vdec_ctx *c)
 
 /* Fill in the buffer layout for the picture the firmware parsed. The firmware
  * geometry is fixed, but the client chooses between the supported single- and
- * multi-planar layouts when it negotiates CAPTURE.
+ * multi-planar layouts when it negotiates CAPTURE. 10-bit pictures convert
+ * to standard single-plane P010.
  */
 static void picture_format(struct vdec_ctx *c, struct v4l2_pix_format_mplane *f)
 {
-	if (f->pixelformat != V4L2_PIX_FMT_NV12M &&
+	if (c->pic.fourcc == V4L2_PIX_FMT_MT2T)
+		f->pixelformat = V4L2_PIX_FMT_P010;
+	else if (f->pixelformat != V4L2_PIX_FMT_NV12M &&
 	    f->pixelformat != V4L2_PIX_FMT_NV12)
 		f->pixelformat = V4L2_PIX_FMT_NV12M;
 
@@ -850,7 +964,12 @@ static void picture_format(struct vdec_ctx *c, struct v4l2_pix_format_mplane *f)
 	f->xfer_func = c->src_fmt.xfer_func;
 	f->ycbcr_enc = c->src_fmt.ycbcr_enc;
 	f->quantization = c->src_fmt.quantization;
-	if (f->pixelformat == V4L2_PIX_FMT_NV12) {
+	if (f->pixelformat == V4L2_PIX_FMT_P010) {
+		f->num_planes = 1;
+		f->plane_fmt[0].bytesperline = c->pic.stride * 2;
+		f->plane_fmt[0].sizeimage =
+			(size_t)c->pic.stride * c->pic.buffer_height * 3;
+	} else if (f->pixelformat == V4L2_PIX_FMT_NV12) {
 		f->num_planes = 1;
 		f->plane_fmt[0].bytesperline = c->pic.stride;
 		f->plane_fmt[0].sizeimage = c->pic.size[0] + c->pic.size[1];
@@ -1472,6 +1591,8 @@ static int enum_format(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 		f->pixelformat = V4L2_PIX_FMT_NV12M;
 	else if (f->index == 1)
 		f->pixelformat = V4L2_PIX_FMT_NV12;
+	else if (f->index == 2)
+		f->pixelformat = V4L2_PIX_FMT_P010;
 	else
 		return -EINVAL;
 	return 0;
@@ -1524,13 +1645,18 @@ static int try_format(struct file *file, void *priv, struct v4l2_format *f)
 					   vdec_capture_size.max_height,
 					   vdec_capture_size.step_height);
 		if (p->pixelformat != V4L2_PIX_FMT_NV12M &&
-		    p->pixelformat != V4L2_PIX_FMT_NV12)
+		    p->pixelformat != V4L2_PIX_FMT_NV12 &&
+		    p->pixelformat != V4L2_PIX_FMT_P010)
 			p->pixelformat = V4L2_PIX_FMT_NV12M;
 		p->colorspace = c->src_fmt.colorspace;
 		p->xfer_func = c->src_fmt.xfer_func;
 		p->ycbcr_enc = c->src_fmt.ycbcr_enc;
 		p->quantization = c->src_fmt.quantization;
-		if (p->pixelformat == V4L2_PIX_FMT_NV12) {
+		if (p->pixelformat == V4L2_PIX_FMT_P010) {
+			p->num_planes = 1;
+			p->plane_fmt[0].bytesperline = p->width * 2;
+			p->plane_fmt[0].sizeimage = (size_t)p->width * p->height * 3;
+		} else if (p->pixelformat == V4L2_PIX_FMT_NV12) {
 			p->num_planes = 1;
 			p->plane_fmt[0].bytesperline = p->width;
 			p->plane_fmt[0].sizeimage = p->width * p->height * 3 / 2;
@@ -1598,7 +1724,8 @@ static int enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenu
 	if (s->index)
 		return -EINVAL;
 	if (s->pixel_format == V4L2_PIX_FMT_NV12M ||
-	    s->pixel_format == V4L2_PIX_FMT_NV12) {
+	    s->pixel_format == V4L2_PIX_FMT_NV12 ||
+	    s->pixel_format == V4L2_PIX_FMT_P010) {
 		s->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 		s->stepwise = vdec_capture_size;
 		return 0;

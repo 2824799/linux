@@ -11,10 +11,14 @@
 /* Upstream V4L2 has no HEIF fourcc; matches vendor V4L2_PIX_FMT_HEIF and the
  * firmware format table ('HEIF'). Upstream spells AV1 'AV01' while the
  * firmware table spells it 'AV10'; the driver bridges the two, the guard
- * only sees the V4L2 spelling.
+ * only sees the V4L2 spelling. MT2T is vendor V4L2_PIX_FMT_MT2110T, the
+ * firmware 10-bit tile layout reported for 10-bit pictures.
  */
 #ifndef V4L2_PIX_FMT_HEIF
 #define V4L2_PIX_FMT_HEIF v4l2_fourcc('H', 'E', 'I', 'F')
+#endif
+#ifndef V4L2_PIX_FMT_MT2T
+#define V4L2_PIX_FMT_MT2T v4l2_fourcc('M', 'T', '2', 'T')
 #endif
 
 /* MPEG-1/2/4 and H.263 use plain MSB-first fields with no RBSP emulation
@@ -221,7 +225,12 @@ static inline int vcp_hevc_sps_guard(const u8 *data, size_t size)
 	colour = vcp_rbsp_ue(&r);
 	if (r.error || !width || !height)
 		return -EINVAL;
-	return luma || colour ? -EOPNOTSUPP : 0;
+	/* 8-bit and 10-bit 4:2:0 only; the firmware has no 4:2:2/4:4:4 or
+	 * 12-bit output layout, and mixed bit depths are not valid streams.
+	 */
+	if (luma != colour || (luma != 0 && luma != 2))
+		return -EOPNOTSUPP;
+	return 0;
 }
 
 /* Firmware MPG2 box: 16x16..2048x1088. Progressive frames only: the frontend

@@ -11,6 +11,7 @@
 #include <linux/unaligned.h>
 
 #include "mtk_vcp_vdec.h"
+#include "mtk_vcp_vdec_bitstream.h"
 
 #define DEC_EVENTS 192
 #define DEC_ALLOCATIONS 128
@@ -555,6 +556,29 @@ out:
 }
 EXPORT_SYMBOL_GPL(mtk_vcp_vdec_query_cap);
 
+/* The firmware only delivers 8-bit MM21 and 10-bit MT2T pictures; anything
+ * else (other bit depths, 4:2:2/4:4:4, compressed layouts) has no frontend
+ * conversion path.
+ */
+static bool vcp_vdec_layout_ok(struct vcp_vdec_vsi *v, struct vcp_vdec_picture *p)
+{
+	u32 depth = le32_to_cpu(v->pic.bitdepth);
+
+	if (depth == 10) {
+		u64 luma = (u64)p->stride * p->buffer_height * 5 / 4;
+
+		return p->fourcc == V4L2_PIX_FMT_MT2T && !(p->stride & 31) &&
+		       !(p->buffer_height & 63) &&
+		       !le32_to_cpu(v->pic.layout) && p->size[0] == luma &&
+		       p->size[1] == p->size[0] / 2;
+	}
+	if (depth == 8)
+		return p->fourcc == V4L2_PIX_FMT_MM21 &&
+		       p->size[0] == (u64)p->stride * p->buffer_height &&
+		       p->size[1] == p->size[0] / 2;
+	return false;
+}
+
 int mtk_vcp_vdec_picture(struct mtk_vcp_vdec *d, struct vcp_vdec_picture *p)
 {
 	struct vcp_vdec_vsi *v;
@@ -580,15 +604,16 @@ int mtk_vcp_vdec_picture(struct mtk_vcp_vdec *d, struct vcp_vdec_picture *p)
 	p->crop_top = le32_to_cpu(v->crop_top);
 	p->crop_width = le32_to_cpu(v->crop_width);
 	p->crop_height = le32_to_cpu(v->crop_height);
+	/* 10-bit pictures arrive in the MT2T tile layout at 10 bits per sample:
+	 * five bytes per four samples. Chroma tiles need an even tile column
+	 * count, hence the 32-aligned stride.
+	 */
 	if (!p->width || p->width > 4096 || !p->height || p->height > 2176 ||
 	    p->stride < p->width || p->stride > 4096 || (p->stride & 15) ||
 	    p->buffer_height < p->height || p->buffer_height > 2176 ||
 	    (p->buffer_height & 31) || !p->dpb || p->dpb > 32 ||
-	    p->fourcc != V4L2_PIX_FMT_MM21 ||
 	    (p->input_driven != 0 && p->input_driven != 2) ||
-	    le32_to_cpu(v->pic.bitdepth) != 8 ||
-	    p->size[0] != p->stride * p->buffer_height ||
-	    p->size[1] != p->size[0] / 2) {
+	    !vcp_vdec_layout_ok(v, p)) {
 		dev_err(d->dev,
 			"unsupported picture %ux%u buffer %ux%u size %u/%u dpb %u format %#x depth %u layout %u input %u\n",
 			p->width, p->height, p->stride, p->buffer_height,
