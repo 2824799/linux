@@ -449,6 +449,13 @@ static int vcp_encoder_set_param(void *handle, enum venc_set_param_type type,
 		config.max_qp = cpu_to_le32(params->hevc_max_qp);
 		if (dst_fourcc == v4l2_fourcc('H', 'E', 'I', 'F'))
 			config.heif_grid_size = cpu_to_le32(p->heif_grid_size);
+	} else if (ten_bit) {
+		/* Only HEVC/HEIF map 10-bit input (Main10) to a firmware
+		 * profile. Anything else with P010 pixels would be emitted
+		 * with an 8-bit profile label (observed: H.264 High
+		 * profile_idc=100 carrying 10-bit depths), so fail closed.
+		 */
+		return -EINVAL;
 	}
 	/* MPEG4-Part2 and H.263 have confirmed codec IDs, but this firmware
 	 * build NACKs their INIT, so the exposure gate keeps those fourccs
