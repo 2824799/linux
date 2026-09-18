@@ -26,13 +26,15 @@ static bool vdec_caps_dump;
 module_param_named(caps_dump, vdec_caps_dump, bool, 0644);
 MODULE_PARM_DESC(caps_dump, "dump the firmware decoder capability tables on session boot");
 
-/* Expose only firmware codecs with implemented layout and queue contracts.
- * VP9 profile 0 uses the same MM21 conversion, but firmware writes chroma
- * immediately after luma regardless of the separate chroma address. Each
- * surface therefore owns one contiguous Y+UV allocation for every codec.
- * VP8 and the MPEG family use synchronous bitstream/frame submission; the
- * size boxes below are the firmware FRAME_SIZES table verbatim
- * (HEIF 16383x16383 stills stay memory-gated by the surface allocator).
+/* Expose only firmware codecs with an implemented layout and queue
+ * contract, verified end to end. VP8 needs a synchronous
+ * bitstream/frame pairing the driver does not implement; VP9 decodes
+ * luma but its chroma plane layout is unknown; HEIF stills are parsed
+ * by firmware with an 8x width and never display for any producible
+ * input (see inspection/vcp-dec-new-20260917/HEIF-FINDINGS.md). None of
+ * the three is advertised, so clients fail fast at negotiation instead
+ * of wedging a session; their bitstream guards stay as defense in depth.
+ * The size boxes below are the firmware FRAME_SIZES table verbatim.
  */
 struct vdec_codec {
 	u32 fourcc;
@@ -46,10 +48,6 @@ static const struct vdec_codec vdec_codecs[] = {
 	  { 16, 4096, 16, 16, 2176, 16 } },
 	{ V4L2_PIX_FMT_HEVC, v4l2_fourcc('H', '2', '6', '5'), VCP_VDEC_H265,
 	  { 16, 4096, 16, 16, 2176, 16 } },
-	{ V4L2_PIX_FMT_VP9, v4l2_fourcc('V', 'P', '9', '0'), VCP_VDEC_VP9,
-	  { 16, 4096, 16, 16, 2176, 16 } },
-	{ V4L2_PIX_FMT_VP8, v4l2_fourcc('V', 'P', '8', '0'), VCP_VDEC_VP8,
-	  { 16, 2048, 16, 16, 1088, 32 } },
 	{ V4L2_PIX_FMT_MPEG2, v4l2_fourcc('M', 'P', 'G', '2'), VCP_VDEC_MPEG12,
 	  { 16, 2048, 16, 16, 1088, 32 } },
 	{ V4L2_PIX_FMT_MPEG4, v4l2_fourcc('M', 'P', 'G', '4'), VCP_VDEC_MPEG4,
@@ -61,8 +59,6 @@ static const struct vdec_codec vdec_codecs[] = {
 	 */
 	{ V4L2_PIX_FMT_AV1, v4l2_fourcc('A', 'V', '1', '0'), VCP_VDEC_AV1,
 	  { 16, 4096, 16, 16, 2176, 32 } },
-	{ V4L2_PIX_FMT_HEIF, v4l2_fourcc('H', 'E', 'I', 'F'), VCP_VDEC_HEIF,
-	  { 16, 16383, 64, 16, 16383, 64 } },
 };
 
 static const struct vdec_codec *vdec_codec_by_fourcc(u32 fourcc)
@@ -307,7 +303,7 @@ static int session_boot(struct vdec_ctx *c)
 		ret = PTR_ERR(c->decoder);
 		c->decoder = NULL;
 		cmpxchg(&c->dev->ctx, c, NULL);
-		VCPDBG("boot: decoder create failed: %d\n", ret);
+			VCPDBG("boot: decoder create failed: %d\n", ret);
 		return ret;
 	}
 	VCPDBG("boot: decoder created\n");
@@ -360,7 +356,7 @@ rollback:
 		if (err)
 			return err;
 		cmpxchg(&c->dev->ctx, c, NULL);
-	}
+		}
 	VCPDBG("boot: rolled back, ret=%d\n", ret);
 	return ret;
 }
@@ -1460,6 +1456,21 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
 	}
 	WRITE_ONCE(c->stopping, false);
 	if (is_output(q->type)) {
+		struct vdec_ctx *owner = READ_ONCE(c->dev->ctx);
+		bool busy = owner && owner != c;
+
+		/* Single-context firmware: a second session would queue
+		 * buffers no job ever runs (ordered workqueue + VCP owned
+		 * elsewhere), stalling silently until killed. Refuse it
+		 * here, instantly, so the client can retry later. The owner
+		 * itself may restart; session_start re-checks anyway.
+		 */
+		if (busy || (owner != c && !mtk_vcp_is_offline(c->dev->vcp))) {
+			VCPDBG("refusing join: owned=%d vcp-offline=%d\n",
+			       !!owner, mtk_vcp_is_offline(c->dev->vcp));
+			ret = -EBUSY;
+			goto return_buffers;
+		}
 		WRITE_ONCE(c->failed, false);
 		c->draining = false;
 		c->drained = false;
@@ -1585,6 +1596,10 @@ static int enum_format(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 		if (f->index >= ARRAY_SIZE(vdec_codecs))
 			return -EINVAL;
 		f->pixelformat = vdec_codecs[f->index].fourcc;
+		/* Coded OUTPUT formats drive codec detection (including
+		 * v4l2-compliance stateful-codec identification).
+		 */
+		f->flags = V4L2_FMT_FLAG_COMPRESSED;
 		return 0;
 	}
 	if (f->index == 0)
@@ -1595,6 +1610,7 @@ static int enum_format(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 		f->pixelformat = V4L2_PIX_FMT_P010;
 	else
 		return -EINVAL;
+	f->flags = 0;
 	return 0;
 }
 static int get_format(struct file *file, void *priv, struct v4l2_format *f)
