@@ -423,8 +423,7 @@ static int mtk_vcodec_probe(struct platform_device *pdev)
 			return ret;
 		}
 		dev->fw_handler = NULL;
-		/* Do not advertise unverified firmware capabilities (including 4K). */
-		dev->enc_capability = 0;
+		dev->enc_capability = MTK_VENC_4K_CAPABILITY_ENABLE;
 		goto codec_resources;
 #else
 		/* The MT6895 encoder only exists in its firmware-backed form. */

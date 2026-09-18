@@ -56,8 +56,6 @@
 
 #define MTK_DEFAULT_FRAMERATE_NUM 1001
 #define MTK_DEFAULT_FRAMERATE_DENOM 30000
-#define MTK_VENC_4K_CAPABILITY_ENABLE BIT(0)
-
 static void mtk_venc_worker(struct work_struct *work);
 
 static const struct v4l2_frmsize_stepwise mtk_venc_hd_framesizes = {
@@ -417,10 +415,19 @@ static struct mtk_q_data *mtk_venc_get_q_data(struct mtk_vcodec_enc_ctx *ctx,
 
 static void vidioc_try_fmt_cap(struct v4l2_format *f)
 {
+	size_t floor;
+
 	f->fmt.pix_mp.field = V4L2_FIELD_NONE;
 	f->fmt.pix_mp.num_planes = 1;
 	f->fmt.pix_mp.plane_fmt[0].bytesperline = 0;
 	f->fmt.pix_mp.flags = 0;
+	/* A zero coded sizeimage proposal used to survive negotiation and
+	 * then fail REQBUFS with zero-sized buffers. Floor it to one byte
+	 * per pixel; the firmware minima are still enforced at configure.
+	 */
+	floor = (size_t)f->fmt.pix_mp.width * f->fmt.pix_mp.height;
+	if (f->fmt.pix_mp.plane_fmt[0].sizeimage < floor)
+		f->fmt.pix_mp.plane_fmt[0].sizeimage = floor;
 }
 
 /* V4L2 specification suggests the driver corrects the format struct if any of

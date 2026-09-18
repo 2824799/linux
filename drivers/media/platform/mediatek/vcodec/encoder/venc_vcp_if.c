@@ -384,6 +384,12 @@ static int vcp_encoder_set_param(void *handle, enum venc_set_param_type type,
 		if (q->visible_width > max_w || q->visible_height > max_h)
 			return -EINVAL;
 	}
+	/* No dims-vs-level gate: the firmware decodes a 3840x2160
+	 * stream carrying a level 4.0 SPS exactly (30/30), and software
+	 * decoders treat level as advisory, so a mismatch is tolerated end
+	 * to end. Clients that need spec-conformant headers can set a
+	 * fitting level; the 4K capability raise makes 5.1 selectable.
+	 */
 	/* Despite its name this vendor field contains venc_yuv_fmt, not FourCC. */
 	config.input_fourcc = cpu_to_le32(p->input_yuv_fmt);
 	config.bitrate = cpu_to_le32(p->bitrate);

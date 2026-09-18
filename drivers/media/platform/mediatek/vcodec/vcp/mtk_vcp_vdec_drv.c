@@ -3,6 +3,7 @@
 #include <linux/atomic.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
@@ -108,7 +109,27 @@ struct vdec_surface {
 struct vdec_pending {
 	u32 surface;
 	u64 timestamp;
+	u64 fw_done_ns;
 };
+/* perf_frames arms ktime staging splits for the next N delivered frames
+ * (0 = off). Re-arm by writing the count again through sysfs; each write
+ * resets the consumed counter. Zero overhead beyond one atomic when off.
+ */
+static int perf_frames;
+static atomic_t perf_used = ATOMIC_INIT(0);
+static int perf_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_int(val, kp);
+
+	if (!ret)
+		atomic_set(&perf_used, 0);
+	return ret;
+}
+static const struct kernel_param_ops perf_ops = {
+	.set = perf_set, .get = param_get_int,
+};
+module_param_cb(perf_frames, &perf_ops, &perf_frames, 0644);
+MODULE_PARM_DESC(perf_frames, "trace ktime splits for the next N delivered frames");
 struct vdec_ctx {
 	struct v4l2_fh fh;
 	struct v4l2_ctrl_handler controls;
@@ -524,7 +545,8 @@ static int collect_events(struct vdec_ctx *c)
 
 		c->surfaces[i].pending = true;
 		c->pending[(c->pending_read + c->pending_count++) % DEC_SURFACES] =
-			(struct vdec_pending){ .surface = i, .timestamp = timestamp };
+			(struct vdec_pending){ .surface = i, .timestamp = timestamp,
+						.fw_done_ns = ktime_get_ns() };
 		VCPDBG("event: display surface=%u pending=%u ts=%llu\n", i,
 		       c->pending_count, timestamp);
 	}
@@ -675,9 +697,25 @@ static int deliver_frames(struct vdec_ctx *c)
 				return -EFAULT;
 			}
 			dma_rmb();
-			detile_10_plane(base, s->plane[0].cpu, stride, 1, stride, bh);
-			detile_10_chroma(base + y_words, s->plane[1].cpu,
-					 stride, bh);
+			if (perf_frames > 0 &&
+			    atomic_inc_return(&perf_used) <= perf_frames) {
+				u64 t0 = ktime_get_ns(), t1, t2;
+
+				detile_10_plane(base, s->plane[0].cpu, stride,
+						1, stride, bh);
+				t1 = ktime_get_ns();
+				detile_10_chroma(base + y_words, s->plane[1].cpu,
+						 stride, bh);
+				t2 = ktime_get_ns();
+				pr_info("VCPERF seq=%u fw_us=%llu y_us=%llu c_us=%llu\n",
+					c->sequence, (t0 - p->fw_done_ns) / 1000,
+					(t1 - t0) / 1000, (t2 - t1) / 1000);
+			} else {
+				detile_10_plane(base, s->plane[0].cpu, stride,
+						1, stride, bh);
+				detile_10_chroma(base + y_words, s->plane[1].cpu,
+						 stride, bh);
+			}
 			vb2_set_plane_payload(&vb->vb2_buf, 0, total);
 			goto delivered;
 		}
@@ -699,10 +737,27 @@ static int deliver_frames(struct vdec_ctx *c)
 				return -EFAULT;
 			}
 			dma_rmb();
-			detile(base, s->plane[0].cpu,
-			       c->pic.stride, c->pic.buffer_height, 32);
-			detile(base + c->pic.size[0], s->plane[1].cpu,
-			       c->pic.stride, c->pic.buffer_height / 2, 16);
+			if (perf_frames > 0 &&
+			    atomic_inc_return(&perf_used) <= perf_frames) {
+				u64 t0 = ktime_get_ns(), t1, t2;
+
+				detile(base, s->plane[0].cpu,
+				       c->pic.stride, c->pic.buffer_height, 32);
+				t1 = ktime_get_ns();
+				detile(base + c->pic.size[0], s->plane[1].cpu,
+				       c->pic.stride, c->pic.buffer_height / 2,
+				       16);
+				t2 = ktime_get_ns();
+				pr_info("VCPERF seq=%u fw_us=%llu y_us=%llu c_us=%llu\n",
+					c->sequence, (t0 - p->fw_done_ns) / 1000,
+					(t1 - t0) / 1000, (t2 - t1) / 1000);
+			} else {
+				detile(base, s->plane[0].cpu,
+				       c->pic.stride, c->pic.buffer_height, 32);
+				detile(base + c->pic.size[0], s->plane[1].cpu,
+				       c->pic.stride, c->pic.buffer_height / 2,
+				       16);
+			}
 			vb2_set_plane_payload(&vb->vb2_buf, 0,
 					      c->pic.size[0] + c->pic.size[1]);
 		} else {
@@ -714,10 +769,27 @@ static int deliver_frames(struct vdec_ctx *c)
 				return -EFAULT;
 			}
 			dma_rmb();
-			detile(y, s->plane[0].cpu,
-			       c->pic.stride, c->pic.buffer_height, 32);
-			detile(uv, s->plane[1].cpu,
-			       c->pic.stride, c->pic.buffer_height / 2, 16);
+			if (perf_frames > 0 &&
+			    atomic_inc_return(&perf_used) <= perf_frames) {
+				u64 t0 = ktime_get_ns(), t1, t2;
+
+				detile(y, s->plane[0].cpu,
+				       c->pic.stride, c->pic.buffer_height, 32);
+				t1 = ktime_get_ns();
+				detile(uv, s->plane[1].cpu,
+				       c->pic.stride, c->pic.buffer_height / 2,
+				       16);
+				t2 = ktime_get_ns();
+				pr_info("VCPERF seq=%u fw_us=%llu y_us=%llu c_us=%llu\n",
+					c->sequence, (t0 - p->fw_done_ns) / 1000,
+					(t1 - t0) / 1000, (t2 - t1) / 1000);
+			} else {
+				detile(y, s->plane[0].cpu,
+				       c->pic.stride, c->pic.buffer_height, 32);
+				detile(uv, s->plane[1].cpu,
+				       c->pic.stride, c->pic.buffer_height / 2,
+				       16);
+			}
 			vb2_set_plane_payload(&vb->vb2_buf, 0, c->pic.size[0]);
 			vb2_set_plane_payload(&vb->vb2_buf, 1, c->pic.size[1]);
 		}
